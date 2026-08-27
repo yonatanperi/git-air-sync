@@ -42,6 +42,11 @@ class ProjectState:
     last_synced_branch: str | None = None
     last_sync_at: str | None = None
     last_payload_sha256: str | None = None
+    # This machine's own branch HEAD immediately after the last successful import
+    # (`git am`-applied, so it never matches `last_synced_commit`, which is the
+    # exporting machine's hash). Used to detect local commits made since then —
+    # see `status` in main.py.
+    last_import_head: str | None = None
     pending_conflict: dict[str, Any] | None = None
 
 

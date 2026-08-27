@@ -9,6 +9,7 @@ from git_air_sync.core.envelope import (
     ChecksumError,
     Envelope,
     HeaderError,
+    LegacyBundleError,
     MagicError,
     VersionError,
     peek,
@@ -22,7 +23,7 @@ def make_meta(**overrides) -> Envelope:
     base = dict(
         project="alpha",
         source_branch="main",
-        bundle_mode="incremental",
+        package_mode="incremental",
         base_sha="a" * 40,
         head_sha="b" * 40,
         commit_count=3,
@@ -67,7 +68,7 @@ class RoundTrip(unittest.TestCase):
             unwrap(truncated)
 
     def test_full_mode_has_no_base(self) -> None:
-        meta, _ = unwrap(wrap(b"x" * 100, make_meta(bundle_mode="full", base_sha=None)))
+        meta, _ = unwrap(wrap(b"x" * 100, make_meta(package_mode="full", base_sha=None)))
         self.assertIsNone(meta.base_sha)
         self.assertFalse(meta.is_incremental)
 
@@ -100,6 +101,33 @@ class Corruption(unittest.TestCase):
         broken[10:12] = (99).to_bytes(2, "big")
         with self.assertRaises(VersionError):
             unwrap(bytes(broken))
+
+    def test_legacy_v1_bundle_package_is_named(self) -> None:
+        """A package from the old git-bundle transport must not read as a generic
+        header-parsing failure — it needs its own, actionable message."""
+        import json
+        import struct
+
+        header = json.dumps(
+            {
+                "project": "alpha",
+                "source_branch": "main",
+                "bundle_mode": "full",  # the field this version renamed away from
+                "head_sha": "b" * 40,
+                "commit_count": 1,
+                "created_at": "2026-01-01T00:00:00Z",
+                "created_by": "hostA",
+                "payload_size": 4,
+                "payload_sha256": "x" * 64,
+                "tool_version": "0.1.0",
+                "tool": "git-air-sync",
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        blob = b"GITAIRSYNC" + struct.pack(">HI", 1, len(header)) + header + b"data"
+        with self.assertRaises(LegacyBundleError):
+            unwrap(blob)
 
     def test_absurd_header_length(self) -> None:
         broken = bytearray(self.blob)
@@ -137,7 +165,7 @@ class Filenames(unittest.TestCase):
         self.assertTrue(name.endswith(".docx"))
 
     def test_full_filename_says_full(self) -> None:
-        name = suggested_filename(make_meta(bundle_mode="full", base_sha=None))
+        name = suggested_filename(make_meta(package_mode="full", base_sha=None))
         self.assertIn("__full-", name)
 
     def test_awkward_project_name_is_made_safe(self) -> None:

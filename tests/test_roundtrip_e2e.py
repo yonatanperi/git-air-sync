@@ -15,6 +15,10 @@ from git_air_sync import config as config_mod
 from git_air_sync.core import git_ops as git, sync
 from git_air_sync.errors import NothingToDo, PayloadError
 
+
+def file_text(repo: Path, name: str) -> str:
+    return (repo / name).read_text(encoding="utf-8")
+
 from .support import ScriptedReporter, commit, head, init_repo, log_subjects, run
 
 
@@ -104,13 +108,16 @@ class HappyPath(RoundTripBase):
         self.assertEqual(result.plan.commit_count, 1)
 
         imported = self._import(result.path)
-        self.assertTrue(imported.merged)
-        self.assertEqual(head(self.b_repo), head(self.a_repo))
+        self.assertTrue(imported.applied)
+        # Commit hashes never match across machines — `git am` always creates a new
+        # object (different committer date) even for byte-identical content — so the
+        # regression net here is content arriving intact, not hash equality.
+        self.assertEqual(file_text(self.b_repo, "three.txt"), file_text(self.a_repo, "three.txt"))
         self.assertIn("three", log_subjects(self.b_repo))
 
     def test_document_size_matches_the_estimate(self) -> None:
-        # Incompressible content, so the bundle is large enough that the fixed OOXML
-        # overhead stops dominating and the asymptotic ratio applies.
+        # Incompressible content, so the patch series is large enough that the fixed
+        # OOXML overhead stops dominating and the asymptotic ratio applies.
         import os as _os
 
         commit(
@@ -120,7 +127,7 @@ class HappyPath(RoundTripBase):
 
         from git_air_sync.core.codec import estimate_docx_size
 
-        estimated = estimate_docx_size(result.bundle_bytes)
+        estimated = estimate_docx_size(result.patch_bytes)
         self.assertLess(
             abs(result.docx_bytes - estimated) / result.docx_bytes,
             0.10,
@@ -135,10 +142,11 @@ class HappyPath(RoundTripBase):
         commit(self.a_repo, "four", "four.txt")
         second = self._export()
         self.assertEqual(second.plan.mode, "incremental")
-        self.assertLess(second.bundle_bytes, first.bundle_bytes)
+        self.assertLess(second.patch_bytes, first.patch_bytes)
 
         self._import(second.path)
-        self.assertEqual(head(self.b_repo), head(self.a_repo))
+        self.assertEqual(file_text(self.b_repo, "four.txt"), file_text(self.a_repo, "four.txt"))
+        self.assertEqual(set(log_subjects(self.b_repo)), set(log_subjects(self.a_repo)))
 
     def test_exporting_with_nothing_new_is_not_an_error(self) -> None:
         commit(self.a_repo, "three", "three.txt")
@@ -146,15 +154,16 @@ class HappyPath(RoundTripBase):
         with self.assertRaises(NothingToDo):
             self._export()
 
-    def test_author_and_date_survive_the_gap(self) -> None:
-        sha = commit(self.a_repo, "three", "three.txt")
-        self._import(self._export().path)
-        fmt = "--format=%an|%ae|%aI|%cn|%s"
-        a_meta = run(["git", "log", "-1", fmt, sha], self.a_repo)
-        b_meta = run(["git", "log", "-1", fmt, sha], self.b_repo)
-        self.assertEqual(a_meta.strip(), b_meta.strip())
-        # The commit must arrive under the same hash, not a rewritten one.
-        self.assertEqual(sha, head(self.a_repo))
+    def test_author_survives_the_gap_under_a_new_hash(self) -> None:
+        commit(self.a_repo, "three", "three.txt")
+        imported = self._import(self._export().path)
+
+        fmt = "--format=%an|%ae|%s"
+        a_meta = run(["git", "log", "-1", fmt, "main"], self.a_repo).strip()
+        b_meta = run(["git", "log", "-1", fmt, imported.local_head], self.b_repo).strip()
+        self.assertEqual(a_meta, b_meta)
+        # The whole point of the patch transport: B's commit is a different object.
+        self.assertNotEqual(imported.local_head, head(self.a_repo))
 
     def test_no_scratch_directories_survive(self) -> None:
         commit(self.a_repo, "three", "three.txt")
@@ -162,10 +171,11 @@ class HappyPath(RoundTripBase):
         leftovers = list(Path(tempfile.gettempdir()).glob(sync.SCRATCH_PREFIX + "*"))
         self.assertEqual(leftovers, [])
 
-    def test_incoming_ref_is_cleaned_up(self) -> None:
+    def test_no_worktrees_survive(self) -> None:
         commit(self.a_repo, "three", "three.txt")
         self._import(self._export().path)
-        self.assertFalse(git.ref_exists(self.b_repo, git.INCOMING_REF))
+        worktrees = run(["git", "worktree", "list"], self.b_repo).strip().splitlines()
+        self.assertEqual(len(worktrees), 1)  # just the main working tree
 
 
 class Bootstrap(RoundTripBase):
@@ -180,27 +190,52 @@ class Bootstrap(RoundTripBase):
 
         self.assertTrue(imported.bootstrapped)
         self.assertTrue((self.b_repo / ".git").is_dir())
-        self.assertEqual(head(self.b_repo), head(self.a_repo))
-        # The temporary bundle must not survive as a remote.
+        self.assertEqual(set(log_subjects(self.b_repo)), set(log_subjects(self.a_repo)))
+        self.assertEqual(file_text(self.b_repo, "three.txt"), file_text(self.a_repo, "three.txt"))
+        # The temporary patch file must not survive as a remote.
         remotes = run(["git", "remote"], self.b_repo).strip()
         self.assertEqual(remotes, "")
 
 
 class Failures(RoundTripBase):
-    def test_missing_prerequisite_is_explained(self) -> None:
+    def test_a_skipped_export_still_applies_via_patch(self) -> None:
+        """The bug that motivated the patch transport: under the old git-bundle
+        mechanism, importing a package whose base commit was never delivered (or,
+        equivalently, no longer exists after a rebase/amend on B) was an unrecoverable
+        hard failure. A patch series doesn't need that commit to exist as an object —
+        only for its content to still be there — so this now just works."""
         commit(self.a_repo, "three", "three.txt")
-        first = self._export()  # base = "two", never delivered
+        first = self._export()  # base = "two", never delivered to B
 
         commit(self.a_repo, "four", "four.txt")
         second = self._export()  # base = "three", which B does not have
 
-        with self.assertRaises(PayloadError) as caught:
-            self._import(second.path)
-
-        message = str(caught.exception)
-        self.assertIn("--full", message)
-        self.assertIn("alpha", message)
+        imported = self._import(second.path)
+        self.assertTrue(imported.applied)
+        self.assertEqual(file_text(self.b_repo, "four.txt"), file_text(self.a_repo, "four.txt"))
         self.assertTrue(first.path.is_file())
+
+    def test_rebased_local_history_surfaces_as_a_conflict_not_a_hard_error(self) -> None:
+        """Same bug, via the scenario the user actually hit: B amends the commit A
+        thinks it last synced, so that exact commit object no longer exists on B at
+        all. A genuine content conflict is still possible and should surface
+        normally — it must not come back as an unrecoverable PayloadError."""
+        commit(self.a_repo, "three", "shared.txt", body="from A\n")
+        first = self._export()
+        self._import(first.path)
+
+        # B rewrites both the content and the identity of the commit A last synced.
+        (self.b_repo / "shared.txt").write_text("from B, amended\n", encoding="utf-8")
+        run(["git", "add", "shared.txt"], self.b_repo)
+        run(["git", "commit", "--amend", "-q", "--no-edit"], self.b_repo)
+        self.assertNotEqual(head(self.b_repo), first.plan.head)
+
+        commit(self.a_repo, "four", "shared.txt", body="from A, again\n")
+        second = self._export()
+
+        with self.assertRaises(sync.MergeConflictDetail) as caught:
+            self._import(second.path)
+        self.assertIn("shared.txt", caught.exception.conflicts)
 
     def test_corrupted_document_is_explained(self) -> None:
         import zipfile
@@ -251,26 +286,29 @@ class Conflicts(RoundTripBase):
         self.assertIsNone(state.last_synced_commit)
         self.assertIsNotNone(state.pending_conflict)
 
-    def test_resolve_finalises_after_the_user_commits(self) -> None:
+    def test_resolve_finalises_after_the_user_stages_and_continues(self) -> None:
         commit(self.a_repo, "three", "shared.txt", body="from A\n")
         commit(self.b_repo, "local", "shared.txt", body="from B\n")
         docx = self._export().path
 
         with self.assertRaises(sync.MergeConflictDetail):
             self._import(docx)
+        self.assertTrue(git.am_in_progress(self.b_repo))
 
-        # Stand in for the human resolving the conflict.
+        # Stand in for the human resolving the conflict — 'git am --continue' (not
+        # 'git commit') is what finishes an am, and finalize_resolution runs it.
         (self.b_repo / "shared.txt").write_text("merged by hand\n", encoding="utf-8")
         run(["git", "add", "shared.txt"], self.b_repo)
-        run(["git", "commit", "-q", "--no-edit"], self.b_repo)
 
         cfg = self._cfg("B")
         self.assertTrue(sync.finalize_resolution(self.b_repo, "alpha", cfg))
 
         state = config_mod.load().project("alpha")
         self.assertIsNotNone(state.last_synced_commit)
+        self.assertIsNotNone(state.last_import_head)
         self.assertIsNone(state.pending_conflict)
-        self.assertFalse(git.ref_exists(self.b_repo, git.INCOMING_REF))
+        self.assertFalse(git.am_in_progress(self.b_repo))
+        self.assertEqual(file_text(self.b_repo, "shared.txt"), "merged by hand\n")
 
     def test_resolve_refuses_while_conflicts_remain(self) -> None:
         from git_air_sync.errors import MergeConflict

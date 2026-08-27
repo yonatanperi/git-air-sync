@@ -25,6 +25,11 @@ from ..vendor.codec.encoder import Encoder
 # The ratio converges to ~1.36 once the fixed OOXML boilerplate stops dominating, so
 # a single multiplier badly underestimates small payloads. Modelling the constant term
 # keeps the estimate within ~3.5% across the whole range.
+#
+# NOTE: the payload is now a plain-text patch series (git format-patch), not a
+# packfile — more compressible than the incompressible input this was calibrated
+# against, so this ratio is a conservative (over-)estimate today. Worth remeasuring;
+# not urgent since the only effect of being wrong is a warning firing too eagerly.
 SIZE_RATIO = 1.40
 SIZE_OVERHEAD = 1024
 

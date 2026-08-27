@@ -98,131 +98,106 @@ class Inspection(GitOpsBase):
         self.assertIn("other", found)
 
 
-class Bundles(GitOpsBase):
-    def test_full_bundle_records_complete_history(self) -> None:
-        bundle = self.root / "full.bundle"
-        git.create_bundle(self.repo, bundle, ["main"])
-        self.assertTrue(bundle.is_file())
+class PatchSeries(GitOpsBase):
+    def test_format_patch_writes_a_nonempty_file(self) -> None:
+        patch = self.root / "full.patch"
+        git.format_patch(self.repo, patch, ["--root", "main"])
+        self.assertTrue(patch.is_file())
+        self.assertGreater(patch.stat().st_size, 0)
+        self.assertIn("Subject:", patch.read_text(encoding="utf-8"))
 
-        verification = git.verify_bundle(self.repo, bundle)
-        self.assertTrue(verification.ok)
-        self.assertTrue(verification.complete_history)
-        self.assertIn("refs/heads/main", verification.refs)
-
-    def test_incremental_bundle_verifies_where_the_base_exists(self) -> None:
-        bundle = self.root / "inc.bundle"
-        git.create_bundle(self.repo, bundle, [f"{self.first}..main"])
-        self.assertTrue(git.verify_bundle(self.repo, bundle).ok)
-
-    def test_missing_prerequisite_is_detected_and_parsed(self) -> None:
-        """The core mechanism for 'B is missing an earlier package'."""
-        bundle = self.root / "inc.bundle"
-        git.create_bundle(self.repo, bundle, [f"{self.first}..main"])
-
-        # A fresh repo that has never seen `first`.
-        other = init_repo(self.root / "other")
-        commit(other, "unrelated", "unrelated.txt")
-
-        verification = git.verify_bundle(other, bundle)
-        self.assertFalse(verification.ok)
-        self.assertIn(self.first, verification.missing_prereqs)
-
-    def test_garbage_is_not_mistaken_for_a_bundle(self) -> None:
-        bogus = self.root / "bogus.bundle"
-        bogus.write_bytes(b"definitely not a bundle")
-        verification = git.verify_bundle(self.repo, bogus)
-        self.assertFalse(verification.ok)
-        self.assertTrue(verification.not_a_bundle)
-
-    def test_fetch_and_merge_from_a_bundle(self) -> None:
+    def test_am_applies_a_clean_series(self) -> None:
         clone = self.root / "clone"
         run(["git", "clone", "-q", str(self.repo), str(clone)])
         run(["git", "remote", "remove", "origin"], clone)
 
-        third = commit(self.repo, "three", "three.txt")
-        bundle = self.root / "inc.bundle"
-        git.create_bundle(self.repo, bundle, [f"{self.second}..main"])
-
-        git.fetch_from_bundle(clone, bundle, "refs/heads/main", git.INCOMING_REF)
-        self.assertTrue(git.ref_exists(clone, git.INCOMING_REF))
-
-        outcome, _ = git.merge_ref(clone, git.INCOMING_REF, message="merge")
-        self.assertIn(
-            outcome, (git.MergeOutcome.FAST_FORWARD, git.MergeOutcome.MERGED)
-        )
-        self.assertEqual(git.resolve_sha(clone, "HEAD"), third)
-
-    def test_incoming_ref_is_hidden_from_git_branch(self) -> None:
-        """refs/air-sync/* must not pollute the user's branch list."""
-        clone = self.root / "clone"
-        run(["git", "clone", "-q", str(self.repo), str(clone)])
         commit(self.repo, "three", "three.txt")
-        bundle = self.root / "inc.bundle"
-        git.create_bundle(self.repo, bundle, [f"{self.second}..main"])
-        git.fetch_from_bundle(clone, bundle, "refs/heads/main", git.INCOMING_REF)
+        patch = self.root / "inc.patch"
+        git.format_patch(self.repo, patch, [f"{self.second}..main"])
 
-        branches = run(["git", "branch"], clone)
-        self.assertNotIn("air-sync", branches)
+        result = git.am_apply(clone, patch, three_way=True)
+        self.assertTrue(result.ok)
+        # Applied for real, but under a NEW hash — `git am` sets its own committer
+        # date, so byte-identical content still doesn't reproduce the original sha.
+        self.assertNotEqual(git.resolve_sha(clone, "HEAD"), git.resolve_sha(self.repo, "HEAD"))
+        self.assertEqual((clone / "three.txt").read_text(), "three\n")
+        self.assertEqual(git.list_commits(clone, "HEAD", limit=1)[0].subject, "three")
 
-    def test_a_branch_named_air_sync_does_not_collide(self) -> None:
-        """The reason for refs/air-sync/ over refs/heads/air-sync/."""
-        run(["git", "branch", "air-sync"], self.repo)
-        clone = self.root / "clone"
-        run(["git", "clone", "-q", str(self.repo), str(clone)])
+    def test_am_applies_even_when_the_base_object_is_missing(self) -> None:
+        """The core fix: B never needs the prerequisite commit to exist as an
+        object — only matching file content, exactly the case a rebase/amend on B
+        used to break."""
+        commit(self.repo, "three", "two.txt", body="two\nthree\n")
+        patch = self.root / "inc.patch"
+        git.format_patch(self.repo, patch, [f"{self.second}..main"])
+
+        # Equivalent content, but a genuinely different commit graph — as if the
+        # user amended history on B. `self.second`'s commit object does not exist
+        # here at all.
+        other = init_repo(self.root / "other")
+        commit(other, "one (redone)", "one.txt", body="one\n")
+        commit(other, "two (redone)", "two.txt", body="two\n")
+        self.assertFalse(git.rev_exists(other, self.second))
+
+        result = git.am_apply(other, patch, three_way=True)
+        self.assertTrue(result.ok)
+        self.assertEqual((other / "two.txt").read_text(), "two\nthree\n")
+
+    def test_bootstrap_onto_a_brand_new_repo(self) -> None:
         commit(self.repo, "three", "three.txt")
-        bundle = self.root / "inc.bundle"
-        git.create_bundle(self.repo, bundle, [f"{self.second}..main"])
-        # Would raise a directory/file ref conflict under refs/heads/air-sync/.
-        git.fetch_from_bundle(clone, bundle, "refs/heads/main", git.INCOMING_REF)
-        self.assertTrue(git.ref_exists(clone, git.INCOMING_REF))
+        full = self.root / "full.patch"
+        git.format_patch(self.repo, full, ["--root", "main"])
 
-    def test_clone_from_bundle_removes_origin(self) -> None:
-        bundle = self.root / "full.bundle"
-        git.create_bundle(self.repo, bundle, ["main"])
         dest = self.root / "bootstrapped"
-        git.clone_from_bundle(bundle, dest, "main")
-        self.assertTrue((dest / ".git").is_dir())
-        self.assertEqual(run(["git", "remote"], dest).strip(), "")
+        git.init_repo(dest, "main")
+        result = git.am_apply(dest, full, three_way=True)
+        self.assertTrue(result.ok)
+        self.assertEqual(
+            set(p for p in run(["git", "ls-files"], dest).splitlines()),
+            {"one.txt", "two.txt", "three.txt"},
+        )
 
-
-class MergePreviews(GitOpsBase):
-    def test_clean_merge_is_predicted(self) -> None:
-        run(["git", "checkout", "-q", "-b", "side"], self.repo)
-        commit(self.repo, "side change", "side.txt")
-        run(["git", "checkout", "-q", "main"], self.repo)
-
-        preview = git.preview_merge(self.repo, "main", "side")
-        self.assertTrue(preview.clean)
-        self.assertEqual(preview.conflicts, [])
-
-    def test_conflict_is_predicted_without_touching_the_worktree(self) -> None:
-        run(["git", "checkout", "-q", "-b", "side"], self.repo)
+    def test_conflict_leaves_am_in_progress_and_abort_rolls_back(self) -> None:
+        run(["git", "checkout", "-q", "-b", "side", self.first], self.repo)
         commit(self.repo, "side", "shared.txt", body="side\n")
+        patch = self.root / "side.patch"
+        git.format_patch(self.repo, patch, [f"{self.first}..side"])
+
         run(["git", "checkout", "-q", "main"], self.repo)
         commit(self.repo, "main", "shared.txt", body="main\n")
+        original_tip = git.resolve_sha(self.repo, "main")
 
-        preview = git.preview_merge(self.repo, "main", "side")
-        self.assertFalse(preview.clean)
-        self.assertIn("shared.txt", preview.conflicts)
-        # The working tree must be untouched by a preview.
-        self.assertFalse(git.working_tree_status(self.repo).dirty)
-        self.assertFalse(git.merge_in_progress(self.repo))
-
-
-class Conflicts(GitOpsBase):
-    def test_conflicted_files_are_listed(self) -> None:
-        run(["git", "checkout", "-q", "-b", "side"], self.repo)
-        commit(self.repo, "side", "shared.txt", body="side\n")
-        run(["git", "checkout", "-q", "main"], self.repo)
-        commit(self.repo, "main", "shared.txt", body="main\n")
-
-        outcome, _ = git.merge_ref(self.repo, "side", message="merge")
-        self.assertIs(outcome, git.MergeOutcome.CONFLICT)
+        result = git.am_apply(self.repo, patch, three_way=True)
+        self.assertFalse(result.ok)
+        self.assertTrue(git.am_in_progress(self.repo))
         self.assertIn("shared.txt", git.conflicted_files(self.repo))
-        self.assertTrue(git.merge_in_progress(self.repo))
 
-        self.assertTrue(git.abort_merge(self.repo))
-        self.assertFalse(git.merge_in_progress(self.repo))
+        self.assertTrue(git.abort_am(self.repo))
+        self.assertFalse(git.am_in_progress(self.repo))
+        self.assertEqual(git.resolve_sha(self.repo, "main"), original_tip)
+
+    def test_worktree_dry_run_does_not_touch_the_real_branch(self) -> None:
+        run(["git", "checkout", "-q", "-b", "side", self.first], self.repo)
+        commit(self.repo, "side", "shared.txt", body="side\n")
+        patch = self.root / "side.patch"
+        git.format_patch(self.repo, patch, [f"{self.first}..side"])
+
+        run(["git", "checkout", "-q", "main"], self.repo)
+        commit(self.repo, "main", "shared.txt", body="main\n")
+        original_tip = git.resolve_sha(self.repo, "main")
+
+        worktree = self.root / "wt"
+        git.add_worktree(self.repo, worktree, "main")
+        try:
+            result = git.am_apply(worktree, patch, three_way=True)
+            self.assertFalse(result.ok)
+            self.assertTrue(git.am_in_progress(worktree))
+            git.abort_am(worktree)
+        finally:
+            git.remove_worktree(self.repo, worktree)
+
+        self.assertEqual(git.resolve_sha(self.repo, "main"), original_tip)
+        self.assertFalse(git.working_tree_status(self.repo).dirty)
 
 
 class Runner(unittest.TestCase):

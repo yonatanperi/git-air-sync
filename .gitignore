@@ -11,3 +11,6 @@ venv/
 # Sync artefacts should never be committed — they are large and single-use.
 *.docx
 *.bundle
+
+# Vendored wheel files
+vendor/wheels/

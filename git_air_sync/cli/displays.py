@@ -182,7 +182,7 @@ def _plain_table(
 
 @contextmanager
 def step(index: int, total: int, text: str) -> Iterator[None]:
-    """``[2/4] Creating bundle`` — a spinner when possible, plain lines otherwise."""
+    """``[2/4] Creating patch series`` — a spinner when possible, plain lines otherwise."""
     label = f"[{index}/{total}] {text}"
     console = theme.console()
 
@@ -247,7 +247,7 @@ def export_summary(result: Any) -> None:
         f"Branch         {plan.branch}",
         f"Commits        {plan.commit_count}",
         f"Range          {base} {icon('arrow')} {plan.head[:7]}",
-        f"Bundle         {human_size(result.bundle_bytes)}",
+        f"Patch series   {human_size(result.patch_bytes)}",
         f"Document       {human_size(result.docx_bytes)}  ({result.ratio:.2f}x)",
         f"Checksum       {result.payload_sha256[:32]}…",
         "",
@@ -262,7 +262,7 @@ def export_summary(result: Any) -> None:
 
 def conflict_panel(repo: Any, conflicts: Sequence[str], project: str) -> None:
     lines = [
-        f"The merge stopped with {len(conflicts)} conflicted file(s):",
+        f"Applying the patch series stopped with {len(conflicts)} conflicted file(s):",
         "",
         *(f"  {icon('bullet')} {path}" for path in conflicts[:20]),
     ]
@@ -276,16 +276,16 @@ def conflict_panel(repo: Any, conflicts: Sequence[str], project: str) -> None:
         "  2.  git status              # see what needs attention",
         "  3.  edit each file, keeping the changes you want",
         "  4.  git add <file>          # mark each one resolved",
-        "  5.  git commit              # complete the merge",
         "",
-        "Then record the sync as finished:",
+        "Then finish and record the sync:",
         "",
         f"  git-air-sync resolve {project}",
         "",
-        "Your recorded sync position has NOT been advanced, so nothing is lost if",
-        "you abort instead with:  git merge --abort",
+        "That runs 'git am --continue' for you — no separate commit needed. Your",
+        "recorded sync position has NOT been advanced, so nothing is lost if you",
+        "abort instead with:  git am --abort",
     ]
-    panel("Merge conflict", lines, Pill.CONFLICT)
+    panel("Patch conflict", lines, Pill.CONFLICT)
 
 
 def sync_status_table(cfg: Any) -> None:

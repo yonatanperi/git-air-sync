@@ -3,19 +3,27 @@
 Move **real git history** onto an air-gapped machine inside a `.docx` file.
 
 Copying files by hand loses commit history, authorship, and branch structure.
-`git-air-sync` bundles commits with native `git bundle`, encodes the bundle into a Word
-document, and on the other side decodes it and merges with native `git merge` — so
-history, authors, dates, and conflict resolution all behave exactly as git normally does.
+`git-air-sync` packages new commits as a native `git format-patch` series, encodes it
+into a Word document, and on the other side decodes it and applies it with native
+`git am` — so history, authors, dates, and conflict resolution all behave the way git
+normally does for a patch series.
 
 ```
 Computer A (online)                          Computer B (air-gapped)
 ─────────────────────                        ───────────────────────
-git bundle create        ──┐
-        ↓                  │  alpha__a1b2c3d-e4f5g6h__20260826.docx
-   envelope + sha256       ├──────────────────────────►  decode + verify
-        ↓                  │                                   ↓
-   encode to .docx       ──┘                            git fetch → git merge
+git format-patch          ──┐
+        ↓                   │  alpha__a1b2c3d-e4f5g6h__20260826.docx
+   envelope + sha256        ├──────────────────────────►  decode + verify
+        ↓                   │                                   ↓
+   encode to .docx        ──┘                          dry run → git am --3way
 ```
+
+**Commit hashes never match between the two machines.** `git am` always creates a new
+commit object on B — even for byte-identical content, its committer date differs from
+A's — so B's history is never byte-for-byte A's history, just the same commits, content,
+authors, and dates, under new hashes. This is deliberate: it's what makes the transport
+robust to B rebasing, amending, or otherwise diverging locally, which the tool doesn't
+require you to avoid.
 
 ## The one rule
 
@@ -48,14 +56,15 @@ network. If the optional packages can't be installed, the tool still runs — it
 back to plain-text output and numbered menus. `git-air-sync doctor` reports what's
 available.
 
-Requires Python 3.10+ and git 2.38+ (older git works, but loses merge previews).
+Requires Python 3.10+ and git 2.28+ (needed for `git init -b <branch>`, used to
+bootstrap a project that doesn't exist yet on Computer B).
 
 ## Use
 
 ```bash
 git-air-sync                 # interactive menu
-git-air-sync export          # A: bundle new commits into a .docx
-git-air-sync import          # B: decode a .docx and merge it
+git-air-sync export          # A: package new commits into a .docx
+git-air-sync import          # B: decode a .docx and apply it
 git-air-sync status          # what has crossed the gap
 git-air-sync resolve         # finish an import that hit conflicts
 git-air-sync config          # settings and sync positions
@@ -71,7 +80,7 @@ uncommitted work, shows you the commits, and writes the document:
 
 ```
   ✓ [1/4] Scanning repository
-  ✓ [2/4] Creating bundle
+  ✓ [2/4] Creating patch series
   ✓ [3/4] Encoding payload
   ✓ [4/4] Writing document
 
@@ -82,7 +91,7 @@ uncommitted work, shows you the commits, and writes the document:
 │ Branch         main                                      │
 │ Commits        7                                         │
 │ Range          a1b2c3d → e4f5g6h                         │
-│ Bundle         412 KB                                    │
+│ Patch series   412 KB                                    │
 │ Document       698 KB  (1.69x)                           │
 ╰──────────────────────────────────────────────────────────╯
 ```
@@ -92,16 +101,19 @@ Useful flags: `--full` (whole history), `--base <sha>` (start elsewhere),
 
 ### Import (Computer B)
 
-Finds packages in your drop folder, verifies the checksum, checks the bundle applies to
-your repo, previews the merge *before* touching your working tree, then merges.
+Finds packages in your drop folder, verifies the checksum, dry-runs the patch series
+in a disposable worktree to predict conflicts *before* touching your working tree,
+then applies it for real with `git am --3way`.
 
 On conflict it stops, tells you exactly which files and what to do, and — importantly —
 **does not advance your recorded sync position**, so nothing is lost. Finish with
-`git-air-sync resolve` once you've committed the merge.
+`git-air-sync resolve` once you've staged the resolved files — it runs
+`git am --continue` for you.
 
 ## Size, speed, and memory
 
-Measured end to end, not estimated:
+Measured end to end against a git-bundle payload (the sizing table predates the switch
+to a patch-series payload — see the note below):
 
 | Bundle | Document | Ratio | Export | Import |
 |--------|----------|-------|--------|--------|
@@ -113,9 +125,15 @@ A git bundle is already-compressed packfile data, so the decimal-digit encoding 
 compress away — the ratio converges to **1.36×**. Small payloads look far worse only
 because ~900 bytes of fixed Word boilerplate dominates them.
 
+> The payload is now a plain-text `git format-patch` series rather than a bundle, which
+> is *more* compressible than the packfile bytes this table was measured against — so
+> real ratios today should be at least this good, likely better. The size-warning
+> threshold (`max_payload_mb`) is calibrated against the old, more conservative numbers,
+> which only means it can fire a little earlier than strictly necessary.
+
 **Memory is the real constraint.** Encoding holds the payload in several
 representations at once: peak RSS was ~620 MB for a 39 MB bundle, roughly **16×**.
-Budget accordingly before syncing a very large repository — a 200 MB bundle would want
+Budget accordingly before syncing a very large repository — a 200 MB payload would want
 well over 3 GB of RAM.
 
 Export warns above 25 MB (configurable via `max_payload_mb`) and checks free disk
@@ -124,12 +142,18 @@ more recent base commit.
 
 ## Things worth knowing
 
-- **Uncommitted changes never travel.** A bundle carries commits. Commit first.
+- **Uncommitted changes never travel.** A patch series carries committed changes only.
+  Commit first.
 - **Only the current branch syncs** by default. Set `export_refs` to `all` in config to
   include every branch and tag.
 - **Rebasing or amending on A invalidates the recorded position**, and recovery is a
   full resync — which for a large repo means a large document. The tool detects this and
   offers you the choice rather than producing a broken package.
+- **Rebasing or amending on B is safe.** Because B applies a patch series rather than
+  fetching a bundle, it never needs a specific commit *object* to exist on B — only
+  matching content. If B has since diverged in a way the patch's context can't resolve,
+  you get a normal, resolvable conflict, never a hard failure telling you to fully
+  resync.
 - **Export records the sync position optimistically**, the moment the file is written —
   before anyone confirms it reached B. If a package is lost in transit, the next export
   starts *after* the lost commits. The export summary prints the hash it recorded;
@@ -137,10 +161,15 @@ more recent base commit.
 - **B is import-only.** Committing on B is not prevented, but those commits can't travel
   back and will cause conflicts on the next import. `git-air-sync status` warns when it
   spots them.
+- **Re-importing the exact same document is a no-op**, detected by checksum. Importing
+  a *different* package that happens to overlap with commits already applied is not
+  specially detected — there's no shared commit graph to check against anymore, so an
+  already-applied change either no-ops harmlessly inside `git am` or, rarely, produces a
+  spurious conflict you can resolve the normal way.
 
 ## Testing
 
-124 tests, stdlib `unittest`, no test dependencies. They pass in four environments —
+121 tests, stdlib `unittest`, no test dependencies. They pass in four environments —
 run at least the first two:
 
 ```bash
@@ -159,7 +188,8 @@ change to be versioned, not a file to update.
 
 `tests/test_roundtrip_e2e.py` does a genuine A→B round trip on one machine — two config
 files via `AIR_SYNC_CONFIG` stand in for two computers — and covers the failure paths
-that matter: corruption, missing prerequisites, conflicts, and bootstrap.
+that matter: corruption, a skipped/never-delivered export, a rebase on B surfacing as a
+normal conflict instead of a hard failure, and bootstrap.
 
 `AIR_SYNC_CONFIG` is a supported feature, not a test hack:
 

@@ -25,7 +25,6 @@ from ..errors import (
     EnvironmentError_,
     MergeConflict,
     NothingToDo,
-    PayloadError,
     UserAbort,
 )
 from . import codec, envelope as env, git_ops as git
@@ -43,8 +42,9 @@ _ACTIVE: set[Path] = set()
 def scratch_dir(prefix: str = SCRATCH_PREFIX) -> Iterator[Path]:
     """A temp directory removed on success, on exception, and on Ctrl-C.
 
-    Bundles never touch the repository working tree — they would show up as untracked
-    files, could be committed by accident, and could be swept by ``git clean``.
+    Patch files and dry-run worktrees never live inside the repository's working
+    tree — they would show up as untracked files, could be committed by accident,
+    and could be swept by ``git clean``.
     """
     directory = Path(tempfile.mkdtemp(prefix=prefix))
     _ACTIVE.add(directory)
@@ -121,13 +121,13 @@ class ExportResult:
     project: str
     path: Path
     plan: ExportPlan
-    bundle_bytes: int
+    patch_bytes: int
     docx_bytes: int
     payload_sha256: str
 
     @property
     def ratio(self) -> float:
-        return self.docx_bytes / self.bundle_bytes if self.bundle_bytes else 0.0
+        return self.docx_bytes / self.patch_bytes if self.patch_bytes else 0.0
 
 
 def resolve_export_plan(
@@ -140,7 +140,7 @@ def resolve_export_plan(
     export_refs: str = "branch",
     assume_yes: bool = False,
 ) -> ExportPlan:
-    """Work out what to bundle, asking the user when history has moved under us.
+    """Work out what to export, asking the user when history has moved under us.
 
     Under ``assume_yes`` every question resolves to its documented default instead of
     prompting, so a scripted export never dead-ends on a non-interactive terminal.
@@ -158,7 +158,7 @@ def resolve_export_plan(
     if branch is None:
         raise EnvironmentError_(
             f"{repo} has a detached HEAD. Check out a branch before exporting, so the "
-            "bundle records a real branch name for Computer B to merge."
+            "package records a real branch name for Computer B to apply."
         )
 
     head = git.resolve_sha(repo, branch)
@@ -241,7 +241,11 @@ def resolve_export_plan(
         return ExportPlan(branch, "incremental", base, head, revs, count, commits)
 
     count = git.count_commits(repo, branch)
-    revs = ["--branches", "--tags"] if export_refs == "all" else [branch]
+    # `git format-patch <ref>` alone is shorthand for `<ref>..HEAD` (empty when they're
+    # equal), unlike `git rev-list`/`git bundle create`'s "everything reachable from
+    # ref" reading of a single positional argument — `--root` forces the full-history
+    # reading `format-patch` actually needs here.
+    revs = ["--root", "--branches", "--tags"] if export_refs == "all" else ["--root", branch]
     return ExportPlan(
         branch, "full", None, head, revs, count, git.list_commits(repo, branch)
     )
@@ -278,9 +282,9 @@ def export_project(
             [
                 f"This repository has uncommitted work ({tree.summary()}).",
                 "",
-                "A git bundle carries commits only. These changes will NOT be included",
-                "in the export and will NOT reach Computer B. Commit them first if you",
-                "want them to travel.",
+                "A patch package carries committed changes only. These changes will NOT",
+                "be included in the export and will NOT reach Computer B. Commit them",
+                "first if you want them to travel.",
             ],
         )
         if not reporter.confirm("Export anyway?", default=False):
@@ -298,25 +302,25 @@ def export_project(
     out_dir.mkdir(parents=True, exist_ok=True)
 
     with scratch_dir() as scratch:
-        bundle_path = scratch / f"{project}.bundle"
+        patch_path = scratch / f"{project}.patch"
 
-        with reporter.step(2, 4, "Creating bundle"):
-            git.create_bundle(repo, bundle_path, plan.revs)
-            bundle = bundle_path.read_bytes()
+        with reporter.step(2, 4, "Creating patch series"):
+            git.format_patch(repo, patch_path, plan.revs)
+            patch_bytes = patch_path.read_bytes()
 
-        if not bundle:
-            raise EnvironmentError_("git produced an empty bundle.")
+        if not patch_bytes:
+            raise EnvironmentError_("git produced an empty patch series.")
 
-        estimated = codec.estimate_docx_size(len(bundle))
+        estimated = codec.estimate_docx_size(len(patch_bytes))
         _check_disk_space(out_dir, estimated)
 
         if estimated > max_payload_mb * 1024 * 1024 and not assume_yes:
             reporter.warn(
                 "Large document",
                 [
-                    f"The bundle is {_human(len(bundle))} and the .docx will be around",
-                    f"{_human(estimated)} — over the {max_payload_mb} MB limit configured",
-                    "for this machine.",
+                    f"The patch series is {_human(len(patch_bytes))} and the .docx will be",
+                    f"around {_human(estimated)} — over the {max_payload_mb} MB limit",
+                    "configured for this machine.",
                     "",
                     "Many transfer channels cap attachment size. Consider exporting from",
                     "a more recent base commit instead.",
@@ -329,18 +333,18 @@ def export_project(
             meta = env.Envelope(
                 project=project,
                 source_branch=plan.branch,
-                bundle_mode=plan.mode,
+                package_mode=plan.mode,
                 base_sha=plan.base,
                 head_sha=plan.head,
                 commit_count=plan.commit_count,
                 hash_algo=git.object_format(repo),
                 created_at=_utc_now(),
                 created_by=f"{socket.gethostname()}",
-                payload_size=len(bundle),
+                payload_size=len(patch_bytes),
                 payload_sha256="",  # recomputed by wrap()
                 tool_version=__version__,
             )
-            blob = env.wrap(bundle, meta)
+            blob = env.wrap(patch_bytes, meta)
             out_path = out_dir / env.suggested_filename(meta)
 
         with reporter.step(4, 4, "Writing document"):
@@ -350,9 +354,9 @@ def export_project(
         project=project,
         path=out_path,
         plan=plan,
-        bundle_bytes=len(bundle),
+        patch_bytes=len(patch_bytes),
         docx_bytes=docx_bytes,
-        payload_sha256=hashlib.sha256(bundle).hexdigest(),
+        payload_sha256=hashlib.sha256(patch_bytes).hexdigest(),
     )
 
 
@@ -364,12 +368,16 @@ class ImportResult:
     project: str
     repo: Path
     envelope: env.Envelope
-    outcome: git.MergeOutcome
+    outcome: git.ApplyOutcome
     commits: list[git.CommitInfo]
     files: list[git.FileChange]
     conflicts: list[str]
     bootstrapped: bool = False
-    merged: bool = False
+    applied: bool = False
+    # This machine's own branch HEAD after applying — NOT `envelope.head_sha`
+    # (Computer A's hash), which `git am` never reproduces. None when nothing was
+    # actually applied to the real repo (the --no-merge / do_merge=False path).
+    local_head: str | None = None
 
 
 def import_document(
@@ -383,20 +391,24 @@ def import_document(
 ) -> ImportResult:
     docx = Path(docx)
 
-    with reporter.step(1, 5, "Reading document"):
+    with reporter.step(1, 4, "Reading document"):
         blob = codec.decode_docx_to_bytes(docx)
-        meta, bundle = env.unwrap(blob)
+        meta, patch_bytes = env.unwrap(blob)
 
-    with reporter.step(2, 5, "Locating project"):
+    with reporter.step(2, 4, "Locating project"):
         repo = repo_override or _locate_repo(meta, cfg)
 
+    state = cfg.project(meta.project)
+    if state.last_payload_sha256 and meta.payload_sha256 == state.last_payload_sha256:
+        raise NothingToDo(f"'{meta.project}' has already imported this exact package.")
+
     with scratch_dir() as scratch:
-        bundle_path = scratch / f"{meta.project}.bundle"
-        bundle_path.write_bytes(bundle)
+        patch_path = scratch / f"{meta.project}.patch"
+        patch_path.write_bytes(patch_bytes)
 
         # Bootstrap: the project doesn't exist here yet.
         if repo is None:
-            if meta.bundle_mode != "full":
+            if meta.package_mode != "full":
                 raise EnvironmentError_(
                     f"'{meta.project}' does not exist on this machine, and this package "
                     f"is an incremental update starting at {meta.short(meta.base_sha)}. "
@@ -414,70 +426,80 @@ def import_document(
                 default=True,
             ):
                 raise UserAbort("Aborted before bootstrap.")
-            with reporter.step(3, 5, "Creating repository"):
-                git.clone_from_bundle(bundle_path, dest, meta.source_branch)
-            _record_import(cfg, meta, dest)
+            with reporter.step(3, 4, "Creating repository"):
+                git.init_repo(dest, meta.source_branch)
+                result = git.am_apply(dest, patch_path, three_way=True)
+                if not result.ok:
+                    detail = (result.stderr or result.stdout).strip()
+                    raise EnvironmentError_(
+                        "Applying the full history to a brand-new repository failed "
+                        f"unexpectedly:\n{detail}"
+                    )
+            commits = git.list_commits(dest, meta.source_branch, limit=50)
+            import_head = git.resolve_sha(dest, meta.source_branch)
+            _record_import(cfg, meta, dest, import_head)
             return ImportResult(
                 project=meta.project,
                 repo=dest,
                 envelope=meta,
-                outcome=git.MergeOutcome.FAST_FORWARD,
-                commits=git.list_commits(dest, meta.source_branch, limit=50),
+                outcome=git.ApplyOutcome.APPLIED,
+                commits=commits,
                 files=[],
                 conflicts=[],
                 bootstrapped=True,
-                merged=True,
+                applied=True,
+                local_head=import_head,
             )
 
-        with reporter.step(3, 5, "Verifying bundle"):
-            _verify_or_explain(repo, bundle_path, meta)
+        ours = git.current_branch(repo) or "HEAD"
+        original_tip = git.resolve_sha(repo, ours)
 
-        with reporter.step(4, 5, "Fetching commits"):
-            refs = git.list_bundle_heads(repo, bundle_path)
-            src_ref = _pick_source_ref(refs, meta)
-            git.fetch_from_bundle(repo, bundle_path, src_ref, git.INCOMING_REF)
-
-            ours = git.current_branch(repo) or "HEAD"
-            commits = git.list_commits(repo, f"{ours}..{git.INCOMING_REF}")
-            base_for_diff = git.merge_base(repo, ours, git.INCOMING_REF) or ours
-            files = git.changed_files(repo, base_for_diff, git.INCOMING_REF)
-            preview = git.preview_merge(repo, ours, git.INCOMING_REF)
-
-        if not commits:
-            git.delete_ref(repo, git.INCOMING_REF)
-            raise NothingToDo(
-                f"'{meta.project}' already contains every commit in this package."
-            )
+        with reporter.step(3, 4, "Checking for conflicts"):
+            with scratch_dir(prefix="git-air-sync-preview-") as preview_scratch:
+                worktree = preview_scratch / "wt"
+                git.add_worktree(repo, worktree, ours)
+                try:
+                    dry_run = git.am_apply(worktree, patch_path, three_way=True)
+                    clean = dry_run.ok
+                    conflicts = [] if clean else git.conflicted_files(worktree)
+                    commits = git.list_commits(worktree, f"{original_tip}..HEAD")
+                    files = git.changed_files(worktree, original_tip, "HEAD")
+                    if not clean and git.am_in_progress(worktree):
+                        git.abort_am(worktree)
+                finally:
+                    git.remove_worktree(repo, worktree)
 
         if not do_merge:
             reporter.show_commits(commits, f"{len(commits)} incoming commit(s)")
+            manual_patch = docx.with_suffix(".patch")
+            shutil.copyfile(patch_path, manual_patch)
             reporter.info(
-                f"Fetched into {git.INCOMING_REF}. Merge it yourself with:\n"
-                f"    git -C {repo} merge {git.INCOMING_REF}"
+                f"Patch series saved to {manual_patch}. Apply it yourself with:\n"
+                f"    git -C {repo} am --3way {manual_patch}"
             )
             return ImportResult(
-                meta.project, repo, meta, git.MergeOutcome.ALREADY_UP_TO_DATE,
-                commits, files, [], merged=False,
+                meta.project, repo, meta,
+                git.ApplyOutcome.APPLIED if clean else git.ApplyOutcome.CONFLICT,
+                commits, files, conflicts, applied=False,
             )
 
         if not assume_yes:
             reporter.show_commits(commits, f"{len(commits)} incoming commit(s)")
             reporter.show_files(files, "Files affected")
-            if preview.clean:
-                reporter.info("This will merge cleanly.")
-            elif preview.conflicts:
+            if clean:
+                reporter.info("This will apply cleanly.")
+            else:
                 reporter.warn(
                     "Conflicts predicted",
                     [
-                        "Merging will produce conflicts in:",
-                        *(f"  {p}" for p in preview.conflicts[:20]),
+                        "Applying will produce conflicts in:",
+                        *(f"  {p}" for p in conflicts[:20]),
                         "",
                         "You will be able to resolve them with normal git tools.",
                     ],
                 )
-            if not reporter.confirm(f"Merge into '{ours}'?", default=True):
-                git.delete_ref(repo, git.INCOMING_REF)
-                raise UserAbort("Aborted at the merge preview.")
+            if not reporter.confirm(f"Apply into '{ours}'?", default=True):
+                raise UserAbort("Aborted at the conflict preview.")
 
         tree = git.working_tree_status(repo)
         if tree.dirty:
@@ -486,39 +508,31 @@ def import_document(
                 [
                     f"'{repo.name}' has uncommitted work ({tree.summary()}).",
                     "",
-                    "Merging on top of a dirty working tree can leave you with a mess",
+                    "Applying on top of a dirty working tree can leave you with a mess",
                     "that is hard to unpick. Commit or stash first.",
                 ],
             )
-            if not assume_yes and not reporter.confirm("Merge anyway?", default=False):
-                git.delete_ref(repo, git.INCOMING_REF)
+            if not assume_yes and not reporter.confirm("Apply anyway?", default=False):
                 raise UserAbort("Aborted because of uncommitted changes.")
 
-        with reporter.step(5, 5, "Merging"):
-            outcome, output = git.merge_ref(
-                repo,
-                git.INCOMING_REF,
-                message=(
-                    f"air-sync: merge {len(commits)} commit(s) from "
-                    f"{meta.created_by} ({meta.short(meta.head_sha)})"
-                ),
-            )
+        with reporter.step(4, 4, "Applying patches"):
+            result = git.am_apply(repo, patch_path, three_way=True)
             # Raised inside the step so it reports failure rather than printing
             # "done" and then contradicting itself with a conflict panel.
-            if outcome is git.MergeOutcome.CONFLICT:
-                conflicts = git.conflicted_files(repo)
-                _record_conflict(cfg, meta, repo, conflicts)
-                raise MergeConflictDetail(meta, repo, conflicts, commits, files)
+            if not result.ok:
+                if git.am_in_progress(repo):
+                    real_conflicts = git.conflicted_files(repo)
+                    _record_conflict(cfg, meta, repo, real_conflicts)
+                    raise MergeConflictDetail(meta, repo, real_conflicts, commits, files)
+                detail = (result.stderr or result.stdout).strip()
+                raise EnvironmentError_(f"Applying the patch series failed:\n{detail}")
 
-    if outcome is git.MergeOutcome.FAILED:
-        git.delete_ref(repo, git.INCOMING_REF)
-        raise EnvironmentError_(f"The merge failed:\n{output}")
-
-    _record_import(cfg, meta, repo)
-    git.delete_ref(repo, git.INCOMING_REF)
+    import_head = git.resolve_sha(repo, ours)
+    _record_import(cfg, meta, repo, import_head)
 
     return ImportResult(
-        meta.project, repo, meta, outcome, commits, files, [], merged=True
+        meta.project, repo, meta, git.ApplyOutcome.APPLIED, commits, files, [],
+        applied=True, local_head=import_head,
     )
 
 
@@ -551,15 +565,22 @@ def finalize_resolution(repo: Path, project: str, cfg: Config) -> bool:
         raise MergeConflict(
             f"{len(remaining)} file(s) still have unresolved conflicts:\n"
             + "\n".join(f"  {p}" for p in remaining)
-            + "\n\nResolve them, 'git add' each one, then 'git commit'."
+            + "\n\nResolve them, 'git add' each one, then run 'git-air-sync resolve' again."
         )
 
-    if git.merge_in_progress(repo):
-        raise MergeConflict(
-            "The conflicts are resolved but the merge is not committed yet.\n"
-            f"Run:  git -C {repo} commit"
-        )
+    if git.am_in_progress(repo):
+        result = git.continue_am(repo)
+        if not result.ok:
+            detail = (result.stderr or result.stdout).strip()
+            raise MergeConflict(f"'git am --continue' did not finish cleanly:\n{detail}")
+        if git.am_in_progress(repo) or git.conflicted_files(repo):
+            raise MergeConflict(
+                "Resolving that file uncovered another conflict further along the "
+                "patch series. Run 'git status', resolve it the same way, then "
+                "'git-air-sync resolve' again."
+            )
 
+    branch = git.current_branch(repo) or "HEAD"
     state = cfg.project(project)
     pending = state.pending_conflict or {}
     head = pending.get("head_sha")
@@ -568,10 +589,10 @@ def finalize_resolution(repo: Path, project: str, cfg: Config) -> bool:
         state.last_synced_branch = pending.get("source_branch")
         state.last_sync_at = _utc_now()
         state.last_payload_sha256 = pending.get("payload_sha256")
+        state.last_import_head = git.resolve_sha(repo, branch)
     state.pending_conflict = None
     save(cfg)
 
-    git.delete_ref(repo, git.INCOMING_REF)
     return True
 
 
@@ -591,65 +612,14 @@ def _locate_repo(meta: env.Envelope, cfg: Config) -> Path | None:
     return None
 
 
-def _pick_source_ref(refs: dict[str, str], meta: env.Envelope) -> str:
-    """Choose which ref to fetch out of the bundle."""
-    wanted = f"refs/heads/{meta.source_branch}"
-    if wanted in refs:
-        return wanted
-    for name in refs:
-        if name.endswith(f"/{meta.source_branch}"):
-            return name
-    heads = [n for n in refs if n.startswith("refs/heads/")]
-    if heads:
-        return heads[0]
-    if refs:
-        return next(iter(refs))
-    raise PayloadError("The bundle contains no refs to fetch.")
-
-
-def _verify_or_explain(repo: Path, bundle_path: Path, meta: env.Envelope) -> None:
-    """Turn ``git bundle verify`` failures into messages that say what to do."""
-    if meta.base_sha and not git.rev_exists(repo, meta.base_sha):
-        raise PayloadError(
-            f"This package is an incremental update that continues from commit "
-            f"{meta.base_sha[:7]}, which is not in your copy of '{meta.project}'.\n\n"
-            "Either an earlier sync package never arrived, or this repository is not "
-            "the one the package was built from.\n\n"
-            "Ask Computer A to export the full history instead:\n"
-            f"    git-air-sync export {meta.project} --full"
-        )
-
-    verification = git.verify_bundle(repo, bundle_path)
-    if verification.ok:
-        return
-
-    if verification.not_a_bundle:
-        raise PayloadError(
-            "The document decoded and passed its checksum, but the payload is not a "
-            "git bundle. This package was probably produced by an incompatible "
-            "version of git-air-sync."
-        )
-
-    if verification.missing_prereqs:
-        missing = "\n".join(f"    {sha[:12]}" for sha in verification.missing_prereqs[:10])
-        raise PayloadError(
-            f"Your copy of '{meta.project}' is missing commits this package builds on:\n"
-            f"{missing}\n\n"
-            "An earlier sync package probably never arrived. Ask Computer A to export "
-            "the full history:\n"
-            f"    git-air-sync export {meta.project} --full"
-        )
-
-    raise PayloadError(f"git could not verify the bundle:\n{verification.raw}")
-
-
-def _record_import(cfg: Config, meta: env.Envelope, repo: Path) -> None:
+def _record_import(cfg: Config, meta: env.Envelope, repo: Path, import_head: str) -> None:
     state = cfg.project(meta.project)
     state.path = str(repo)
     state.last_synced_commit = meta.head_sha
     state.last_synced_branch = meta.source_branch
     state.last_sync_at = _utc_now()
     state.last_payload_sha256 = meta.payload_sha256
+    state.last_import_head = import_head
     state.pending_conflict = None
     save(cfg)
 
@@ -675,7 +645,7 @@ def _check_disk_space(out_dir: Path, estimated: int) -> None:
         free = shutil.disk_usage(out_dir).free
     except OSError:
         return
-    needed = estimated * 3  # bundle + in-memory document + the .part file
+    needed = estimated * 3  # patch series + in-memory document + the .part file
     if free < needed:
         raise EnvironmentError_(
             f"Not enough free space in {out_dir}: about {_human(needed)} is needed but "

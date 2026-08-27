@@ -197,12 +197,12 @@ def menu() -> None:
 
     entries: list[Choice] = []
     if cfg.machine_role == "B":
-        entries.append(Choice("import", "Import a package", "decode a .docx and merge it"))
+        entries.append(Choice("import", "Import a package", "decode a .docx and apply it"))
     elif cfg.machine_role == "A":
-        entries.append(Choice("export", "Export a package", "bundle commits into a .docx"))
+        entries.append(Choice("export", "Export a package", "package commits into a .docx"))
     else:
-        entries.append(Choice("export", "Export a package", "bundle commits into a .docx"))
-        entries.append(Choice("import", "Import a package", "decode a .docx and merge it"))
+        entries.append(Choice("export", "Export a package", "package commits into a .docx"))
+        entries.append(Choice("import", "Import a package", "decode a .docx and apply it"))
     entries += [
         Choice("status", "Show sync status", "what has crossed the gap"),
         Choice("resolve", "Finish a conflicted import", ""),
@@ -245,7 +245,7 @@ def export(
     assume_yes: bool,
     force_role: bool,
 ) -> None:
-    """Bundle new commits into a .docx for transfer (Computer A)."""
+    """Package new commits into a .docx for transfer (Computer A)."""
     cfg = _load_config()
     _require_git()
     _check_role(cfg, "A", force_role, "export")
@@ -285,8 +285,8 @@ def export(
 @cli.command("import")
 @click.argument("docx", required=False)
 @click.option("--project", help="Override the project named in the package.")
-@click.option("--repo", "repo_path", type=click.Path(), help="Merge into this repo.")
-@click.option("--no-merge", is_flag=True, help="Fetch only; do not merge.")
+@click.option("--repo", "repo_path", type=click.Path(), help="Apply into this repo.")
+@click.option("--no-merge", is_flag=True, help="Save the patch series only; do not apply it.")
 @click.option("--yes", "-y", "assume_yes", is_flag=True, help="Skip all confirmations.")
 @click.option("--force-role", is_flag=True, help="Run even if this machine is role A.")
 def import_cmd(
@@ -297,7 +297,7 @@ def import_cmd(
     assume_yes: bool,
     force_role: bool,
 ) -> None:
-    """Decode a .docx package and merge it into a repository (Computer B)."""
+    """Decode a .docx package and apply it to a repository (Computer B)."""
     cfg = _load_config()
     _require_git()
     _check_role(cfg, "B", force_role, "import")
@@ -322,21 +322,21 @@ def import_cmd(
         raise SystemExit(conflict.exit_code)
 
     meta = result.envelope
-    verb = "Created" if result.bootstrapped else "Merged"
-    displays.panel(
-        "Import complete",
-        [
-            f"Project        {result.project}",
-            f"Repository     {result.repo}",
-            f"Branch         {meta.source_branch}",
-            f"Commits        {len(result.commits)}",
-            f"Now at         {meta.head_sha[:7]}",
-            f"From           {meta.created_by} on {meta.created_at[:10]}",
-            "",
-            f"{verb} successfully.",
-        ],
-        Pill.SUCCESS,
-    )
+    verb = "Created" if result.bootstrapped else ("Applied" if result.applied else "Saved")
+    lines = [
+        f"Project        {result.project}",
+        f"Repository     {result.repo}",
+        f"Branch         {meta.source_branch}",
+        f"Commits        {len(result.commits)}",
+    ]
+    if result.local_head:
+        lines.append(f"Now at         {result.local_head[:7]}")
+    lines += [
+        f"From           {meta.created_by} on {meta.created_at[:10]}",
+        "",
+        f"{verb} successfully.",
+    ]
+    displays.panel("Import complete", lines, Pill.SUCCESS)
 
 
 # ------------------------------------------------------------------------- resolve
@@ -345,7 +345,7 @@ def import_cmd(
 @cli.command()
 @click.argument("project", required=False)
 def resolve(project: str | None) -> None:
-    """Finish an import that stopped with merge conflicts."""
+    """Finish an import that stopped with patch conflicts."""
     cfg = _load_config()
     _require_git()
     displays.banner(cfg.role_label)
@@ -388,7 +388,7 @@ def resolve(project: str | None) -> None:
             f"'{project}' is now synced at "
             f"{(state.last_synced_commit or '')[:7]}.",
             "",
-            "The temporary sync ref has been removed.",
+            "The pending conflict has been cleared.",
         ],
         Pill.SUCCESS,
     )
@@ -422,13 +422,13 @@ def status(project: str | None) -> None:
             if project and name != project:
                 continue
             repo = config_mod.resolve_path(state.path)
-            if not repo or not repo.exists() or not state.last_synced_commit:
+            if not repo or not repo.exists() or not state.last_import_head:
                 continue
-            if not git.rev_exists(repo, state.last_synced_commit):
+            if not git.rev_exists(repo, state.last_import_head):
                 continue
             branch = git.current_branch(repo)
-            if branch and git.resolve_sha(repo, branch) != state.last_synced_commit:
-                ahead = git.count_commits(repo, f"{state.last_synced_commit}..{branch}")
+            if branch and git.resolve_sha(repo, branch) != state.last_import_head:
+                ahead = git.count_commits(repo, f"{state.last_import_head}..{branch}")
                 if ahead:
                     displays.panel(
                         f"Local commits in '{name}'",
@@ -438,7 +438,7 @@ def status(project: str | None) -> None:
                             "",
                             "This machine is configured as import-only, so those commits "
                             "cannot travel back to Computer A, and they are what will "
-                            "cause merge conflicts on the next import.",
+                            "cause patch conflicts on the next import.",
                         ],
                         Pill.PENDING,
                     )
@@ -576,19 +576,44 @@ def _edit_hashes(cfg: Config) -> None:
 
     state = cfg.project(name)
     repo = config_mod.resolve_path(state.path)
+    branch = git.current_branch(repo) if repo and repo.exists() else None
 
-    def validate(value: str) -> tuple[bool, str]:
-        if value.strip() in ("", "-", "none"):
+    options = []
+    if repo and repo.exists() and branch:
+        options.append(Choice("pick", "Pick from recent commits", "same as a first-time export"))
+    options.append(Choice("manual", "Enter a commit hash"))
+    if state.last_synced_commit:
+        options.append(Choice("clear", "Clear (mark as never synced)"))
+    options.append(Choice(None, "(back)"))
+
+    action = prompts.select(f"Last synced commit for '{name}'", options)
+    if action is None:
+        return
+
+    if action == "clear":
+        new_value = ""
+    elif action == "pick":
+        commits = git.list_commits(repo, branch, limit=50)
+        if not commits:
+            displays.note(f"'{name}' has no commits to choose from.", Pill.PENDING)
+            return
+        new_value = ConsoleReporter().choose_commit(
+            commits, f"Last synced commit for '{name}'"
+        )
+    else:
+
+        def validate(value: str) -> tuple[bool, str]:
+            if value.strip() in ("", "-", "none"):
+                return True, ""
+            if repo and repo.exists() and not git.rev_exists(repo, value.strip()):
+                return False, f"{value.strip()[:12]} is not a commit in {repo.name}."
             return True, ""
-        if repo and repo.exists() and not git.rev_exists(repo, value.strip()):
-            return False, f"{value.strip()[:12]} is not a commit in {repo.name}."
-        return True, ""
 
-    new_value = prompts.text(
-        f"Last synced commit for '{name}' (blank or '-' to clear)",
-        default=state.last_synced_commit or "",
-        validate=validate,
-    ).strip()
+        new_value = prompts.text(
+            f"Last synced commit for '{name}' (blank or '-' to clear)",
+            default=state.last_synced_commit or "",
+            validate=validate,
+        ).strip()
 
     state.last_synced_commit = None if new_value in ("", "-", "none") else new_value
     if state.last_synced_commit and repo and repo.exists():
@@ -623,12 +648,12 @@ def doctor() -> None:
     try:
         version = git.git_version()
         parts = version.split()[2].split(".")
-        modern = (int(parts[0]), int(parts[1])) >= (2, 38)
+        modern = (int(parts[0]), int(parts[1])) >= (2, 28)
         rows.append(
             (
                 "git",
                 "OK" if modern else "OLD",
-                version + ("" if modern else " — merge previews need 2.38+"),
+                version + ("" if modern else " — bootstrapping a repo needs 2.28+"),
             )
         )
     except (git.GitMissingError, IndexError, ValueError):
@@ -740,7 +765,7 @@ def init() -> None:
 
 
 def main() -> int:
-    # SIGTERM would otherwise kill us without unwinding, stranding a large bundle in
+    # SIGTERM would otherwise kill us without unwinding, stranding a large payload in
     # the temp directory. Turning it into SystemExit lets `finally` and atexit run.
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(EXIT_INTERRUPTED))
 

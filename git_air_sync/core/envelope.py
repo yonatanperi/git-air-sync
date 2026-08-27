@@ -1,14 +1,14 @@
 """Framing for the payload carried inside the .docx.
 
 The codec layer has no magic bytes, no version, and no checksum, so corruption there
-is silent. This module wraps the git bundle in a header that makes every failure mode
-detectable and nameable:
+is silent. This module wraps the git patch series in a header that makes every
+failure mode detectable and nameable:
 
     offset 0    : 10 bytes   b"GITAIRSYNC"           magic
     offset 10   :  2 bytes   uint16 envelope version
     offset 12   :  4 bytes   uint32 header length N
     offset 16   :  N bytes   UTF-8 JSON header
-    offset 16+N :  rest      raw git bundle bytes
+    offset 16+N :  rest      raw patch series bytes (git format-patch mailbox text)
 
 The JSON is serialised deterministically (sorted keys, no whitespace) so identical
 inputs produce byte-identical documents.
@@ -25,7 +25,7 @@ from typing import Any
 from ..errors import PayloadError
 
 MAGIC = b"GITAIRSYNC"
-ENVELOPE_VERSION = 1
+ENVELOPE_VERSION = 2
 _HEADER_STRUCT = struct.Struct(">HI")  # version, header length
 _PREFIX_LEN = len(MAGIC) + _HEADER_STRUCT.size
 _MAX_HEADER_LEN = 64 * 1024
@@ -51,6 +51,10 @@ class ChecksumError(EnvelopeError):
     """The payload does not match the length or digest recorded in the header."""
 
 
+class LegacyBundleError(EnvelopeError):
+    """The package used the old git-bundle transport (envelope v1), no longer read."""
+
+
 CORRUPTION_ADVICE = (
     "The document was almost certainly opened and re-saved by Word, or reflowed by a "
     "mail client — that rewrites the paragraphs the encoding depends on. Re-export on "
@@ -60,11 +64,17 @@ CORRUPTION_ADVICE = (
 
 @dataclass(frozen=True)
 class Envelope:
-    """Everything Computer B needs to know about a payload before touching git."""
+    """Everything Computer B needs to know about a payload before touching git.
+
+    ``base_sha``/``head_sha`` name the commit range this patch series covers *on
+    Computer A*. Computer B can no longer verify ``base_sha`` independently (its own
+    history is built from ``git am``-applied commits with different hashes) — these
+    fields are informational/display only on the receiving side.
+    """
 
     project: str
     source_branch: str
-    bundle_mode: str  # "full" | "incremental"
+    package_mode: str  # "full" | "incremental"
     head_sha: str
     commit_count: int
     created_at: str
@@ -82,7 +92,7 @@ class Envelope:
 
     @property
     def is_incremental(self) -> bool:
-        return self.bundle_mode == "incremental"
+        return self.package_mode == "incremental"
 
     def short(self, sha: str | None) -> str:
         return sha[:7] if sha else "—"
@@ -91,7 +101,7 @@ class Envelope:
 _REQUIRED = (
     "project",
     "source_branch",
-    "bundle_mode",
+    "package_mode",
     "head_sha",
     "commit_count",
     "created_at",
@@ -102,27 +112,27 @@ _REQUIRED = (
 )
 
 
-def wrap(bundle: bytes, meta: Envelope) -> bytes:
-    """Frame ``bundle`` with ``meta``. The digest fields in ``meta`` are recomputed."""
-    if not bundle:
-        raise EnvelopeError("refusing to wrap an empty bundle")
+def wrap(data: bytes, meta: Envelope) -> bytes:
+    """Frame ``data`` with ``meta``. The digest fields in ``meta`` are recomputed."""
+    if not data:
+        raise EnvelopeError("refusing to wrap an empty payload")
 
-    payload = dict(asdict(meta))
-    payload.pop("extra", None)
-    payload.update(meta.extra)
-    payload["tool"] = "git-air-sync"
-    payload["payload_size"] = len(bundle)
-    payload["payload_sha256"] = hashlib.sha256(bundle).hexdigest()
+    header_fields = dict(asdict(meta))
+    header_fields.pop("extra", None)
+    header_fields.update(meta.extra)
+    header_fields["tool"] = "git-air-sync"
+    header_fields["payload_size"] = len(data)
+    header_fields["payload_sha256"] = hashlib.sha256(data).hexdigest()
 
     header = json.dumps(
-        payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+        header_fields, sort_keys=True, separators=(",", ":"), ensure_ascii=True
     ).encode("utf-8")
 
     return (
         MAGIC
         + _HEADER_STRUCT.pack(meta.envelope_version, len(header))
         + header
-        + bundle
+        + data
     )
 
 
@@ -137,7 +147,7 @@ def peek(blob: bytes) -> Envelope:
 
 
 def unwrap(blob: bytes) -> tuple[Envelope, bytes]:
-    """Parse and fully validate. Returns ``(envelope, bundle_bytes)``."""
+    """Parse and fully validate. Returns ``(envelope, payload_bytes)``."""
     return _split(blob, verify=True)
 
 
@@ -161,6 +171,13 @@ def _split(blob: bytes, *, verify: bool) -> tuple[Envelope, bytes]:
     version, header_len = _HEADER_STRUCT.unpack(
         blob[len(MAGIC) : _PREFIX_LEN]
     )
+
+    if version == 1:
+        raise LegacyBundleError(
+            "This package was created by an older git-air-sync that used the git "
+            "bundle transport, which this version no longer supports.\n\n"
+            "Re-export it from Computer A with the current version of git-air-sync."
+        )
 
     if version > ENVELOPE_VERSION:
         raise VersionError(

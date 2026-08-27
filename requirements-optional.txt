@@ -1,0 +1,5 @@
+# Optional. Without these the tool still works, in plain text with numbered menus.
+# Every one of these resolves to a pure-Python py3-none-any wheel, so the vendored
+# copies in vendor/wheels/ are portable to any OS and architecture.
+rich==15.0.0
+questionary==2.1.1

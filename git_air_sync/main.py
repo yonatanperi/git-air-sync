@@ -198,10 +198,11 @@ def menu() -> None:
     entries: list[Choice] = []
     if cfg.machine_role == "B":
         entries.append(Choice("import", "Import a package", "decode a .docx and merge it"))
-        entries.append(Choice("export", "Export a package", "Computer A operation"))
+    elif cfg.machine_role == "A":
+        entries.append(Choice("export", "Export a package", "bundle commits into a .docx"))
     else:
         entries.append(Choice("export", "Export a package", "bundle commits into a .docx"))
-        entries.append(Choice("import", "Import a package", "Computer B operation"))
+        entries.append(Choice("import", "Import a package", "decode a .docx and merge it"))
     entries += [
         Choice("status", "Show sync status", "what has crossed the gap"),
         Choice("resolve", "Finish a conflicted import", ""),

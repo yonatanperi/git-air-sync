@@ -93,6 +93,12 @@ def _pick_project(
     if not repos:
         raise EnvironmentError_(f"No git repositories found under {root}.")
 
+    def _last_used(repo: Path) -> str:
+        state = cfg.projects.get(repo.name)
+        return (state.last_sync_at if state else None) or ""
+
+    repos = sorted(repos, key=_last_used, reverse=True)
+
     default = cfg.default_project
     if default and any(r.name == default for r in repos):
         chosen = next(r for r in repos if r.name == default)

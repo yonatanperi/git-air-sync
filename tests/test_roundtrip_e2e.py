@@ -325,6 +325,82 @@ class Conflicts(RoundTripBase):
             sync.finalize_resolution(self.b_repo, "alpha", cfg)
 
 
+class ExcludePatterns(RoundTripBase):
+    """CLAUDE.md is in Config.DEFAULT_EXCLUDE_PATTERNS, so B's fresh (never
+    saved) config already carries it — no per-test setup needed to enable it."""
+
+    def test_export_never_transmits_a_fully_excluded_commit(self) -> None:
+        commit(self.a_repo, "claude notes", "CLAUDE.md", body="notes\n")
+        commit(self.a_repo, "three", "three.txt")
+
+        result = self._export(exclude_patterns=["CLAUDE.md"])
+        self.assertEqual(result.plan.commit_count, 2)  # before exclusion
+        self.assertEqual(result.commit_count, 1)  # actually transmitted
+
+        self._import(result.path)
+        self.assertFalse((self.b_repo / "CLAUDE.md").exists())
+        self.assertEqual(file_text(self.b_repo, "three.txt"), "three\n")
+        self.assertNotIn("claude notes", log_subjects(self.b_repo))
+
+    def test_import_auto_resolves_when_only_an_excluded_file_conflicts(self) -> None:
+        # No exclude_patterns passed at export — simulates a package made before
+        # export-time exclusion existed; the import-time safety net must still
+        # catch it, using B's default exclude patterns.
+        commit(self.a_repo, "a notes", "CLAUDE.md", body="from A\n")
+        commit(self.b_repo, "b notes", "CLAUDE.md", body="from B\n")
+
+        docx = self._export().path
+        imported = self._import(docx)
+
+        self.assertTrue(imported.applied)
+        self.assertEqual(imported.auto_resolved, ["CLAUDE.md"])
+        self.assertEqual(file_text(self.b_repo, "CLAUDE.md"), "from B\n")
+        self.assertFalse(git.am_in_progress(self.b_repo))
+
+        cfg = self._cfg("B")
+        self.assertIsNone(cfg.project("alpha").pending_conflict)
+
+    def test_mixed_series_stops_at_the_genuine_conflict_only(self) -> None:
+        commit(self.a_repo, "a claude", "CLAUDE.md", body="from A\n")
+        commit(self.a_repo, "a shared", "shared.txt", body="from A\n")
+        commit(self.b_repo, "b claude", "CLAUDE.md", body="from B\n")
+        commit(self.b_repo, "b shared", "shared.txt", body="from B\n")
+
+        docx = self._export().path
+
+        with self.assertRaises(sync.MergeConflictDetail) as caught:
+            self._import(docx)
+
+        conflict = caught.exception
+        self.assertEqual(conflict.conflicts, ["shared.txt"])
+        self.assertEqual(conflict.auto_resolved, ["CLAUDE.md"])
+        self.assertEqual(file_text(self.b_repo, "CLAUDE.md"), "from B\n")
+        self.assertTrue(git.am_in_progress(self.b_repo))
+
+    def test_resolve_auto_resolves_a_later_excluded_conflict_in_the_same_series(
+        self,
+    ) -> None:
+        commit(self.a_repo, "a shared", "shared.txt", body="from A\n")
+        commit(self.a_repo, "a claude", "CLAUDE.md", body="from A\n")
+        commit(self.b_repo, "b shared", "shared.txt", body="from B\n")
+        commit(self.b_repo, "b claude", "CLAUDE.md", body="from B\n")
+
+        docx = self._export().path
+        with self.assertRaises(sync.MergeConflictDetail) as caught:
+            self._import(docx)
+        self.assertEqual(caught.exception.conflicts, ["shared.txt"])
+        self.assertEqual(caught.exception.auto_resolved, [])
+
+        (self.b_repo / "shared.txt").write_text("merged\n", encoding="utf-8")
+        run(["git", "add", "shared.txt"], self.b_repo)
+
+        cfg = self._cfg("B")
+        self.assertTrue(sync.finalize_resolution(self.b_repo, "alpha", cfg))
+        self.assertFalse(git.am_in_progress(self.b_repo))
+        self.assertEqual(file_text(self.b_repo, "CLAUDE.md"), "from B\n")
+        self.assertEqual(file_text(self.b_repo, "shared.txt"), "merged\n")
+
+
 class DirtyTree(RoundTripBase):
     def test_uncommitted_changes_prompt_and_are_excluded(self) -> None:
         commit(self.a_repo, "three", "three.txt")

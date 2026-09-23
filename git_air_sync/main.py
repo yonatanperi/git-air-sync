@@ -25,6 +25,10 @@ from .errors import (
 
 CONTEXT_SETTINGS = {"help_option_names": ["-h", "--help"]}
 
+# Sentinel for a "(back)" menu choice — distinct from every real value a select()
+# might return, including None (which some menus use for "no default"/"clear").
+_BACK = object()
+
 
 # ------------------------------------------------------------------------- helpers
 
@@ -195,36 +199,42 @@ def menu() -> None:
 
     _require_git()
 
-    entries: list[Choice] = []
-    if cfg.machine_role == "B":
-        entries.append(Choice("import", "Import a package", "decode a .docx and apply it"))
-    elif cfg.machine_role == "A":
-        entries.append(Choice("export", "Export a package", "package commits into a .docx"))
-    else:
-        entries.append(Choice("export", "Export a package", "package commits into a .docx"))
-        entries.append(Choice("import", "Import a package", "decode a .docx and apply it"))
-    entries += [
-        Choice("status", "Show sync status", "what has crossed the gap"),
-        Choice("resolve", "Finish a conflicted import", ""),
-        Choice("config", "Settings", ""),
-        Choice("doctor", "Check this machine", ""),
-        Choice("quit", "Quit", ""),
-    ]
-
-    action = prompts.select("What would you like to do?", entries)
-
-    if action == "quit":
-        return
-    command = {
+    command_map = {
         "export": export,
         "import": import_cmd,
         "status": status,
         "resolve": resolve,
         "config": config_cmd,
         "doctor": doctor,
-    }[action]
-    ctx = click.get_current_context()
-    ctx.invoke(command)
+    }
+
+    # Loop so that finishing (or backing out of) any submenu returns here instead
+    # of ending the process — only "quit" actually exits.
+    while True:
+        entries: list[Choice] = []
+        if cfg.machine_role == "B":
+            entries.append(Choice("import", "Import a package", "decode a .docx and apply it"))
+        elif cfg.machine_role == "A":
+            entries.append(Choice("export", "Export a package", "package commits into a .docx"))
+        else:
+            entries.append(Choice("export", "Export a package", "package commits into a .docx"))
+            entries.append(Choice("import", "Import a package", "decode a .docx and apply it"))
+        entries += [
+            Choice("status", "Show sync status", "what has crossed the gap"),
+            Choice("resolve", "Finish a conflicted import", ""),
+            Choice("config", "Settings", ""),
+            Choice("doctor", "Check this machine", ""),
+            Choice("quit", "Quit", ""),
+        ]
+
+        action = prompts.select("What would you like to do?", entries)
+
+        if action == "quit":
+            return
+
+        ctx = click.get_current_context()
+        ctx.invoke(command_map[action])
+        cfg = _load_config()  # a settings change may have altered the role/menu
 
 
 # -------------------------------------------------------------------------- export
@@ -268,6 +278,7 @@ def export(
         assume_yes=assume_yes,
         max_payload_mb=cfg.max_payload_mb,
         export_refs=cfg.export_refs,
+        exclude_patterns=cfg.effective_exclude_patterns(name),
     )
 
     state.last_synced_commit = result.plan.head
@@ -318,7 +329,9 @@ def import_cmd(
             assume_yes=assume_yes,
         )
     except sync.MergeConflictDetail as conflict:
-        displays.conflict_panel(conflict.repo, conflict.conflicts, conflict.envelope.project)
+        displays.conflict_panel(
+            conflict.repo, conflict.conflicts, conflict.envelope.project, conflict.auto_resolved
+        )
         raise SystemExit(conflict.exit_code)
 
     meta = result.envelope
@@ -331,6 +344,10 @@ def import_cmd(
     ]
     if result.local_head:
         lines.append(f"Now at         {result.local_head[:7]}")
+    if result.auto_resolved:
+        lines.append(
+            f"Kept local     {len(result.auto_resolved)} excluded file(s), not overwritten"
+        )
     lines += [
         f"From           {meta.created_by} on {meta.created_at[:10]}",
         "",
@@ -367,11 +384,13 @@ def resolve(project: str | None) -> None:
         if len(pending) == 1:
             project = next(iter(pending))
         else:
-            project = prompts.select(
-                "Which project?",
-                [Choice(name, name) for name in sorted(pending)],
-                flag="PROJECT",
-            )
+            choices = [Choice(name, name) for name in sorted(pending)] + [
+                Choice(_BACK, "(back)")
+            ]
+            selection = prompts.select("Which project?", choices, flag="PROJECT")
+            if selection is _BACK:
+                return
+            project = selection
 
     state = cfg.projects.get(project)
     if not state or not state.pending_conflict:
@@ -465,6 +484,7 @@ def config_cmd() -> None:
                 f"Default project  {cfg.default_project or '(none)'}",
                 f"Size warning     {cfg.max_payload_mb} MB",
                 f"Refs exported    {cfg.export_refs}",
+                f"Exclude patterns {len(cfg.exclude_patterns)} global",
             ],
             Pill.INFO,
         )
@@ -479,12 +499,13 @@ def config_cmd() -> None:
                 Choice("role", "Machine role"),
                 Choice("size", "Size warning threshold"),
                 Choice("refs", "Which refs to export"),
+                Choice("exclude", "Exclude patterns (files never synced across the air gap)"),
                 Choice("hashes", "Inspect / override sync positions"),
-                Choice("done", "Done"),
+                Choice(_BACK, "(back)"),
             ],
         )
 
-        if action == "done":
+        if action is _BACK:
             return
         if action == "root":
             cfg.projects_root = str(
@@ -511,16 +532,23 @@ def config_cmd() -> None:
                 )
             )
         elif action == "default":
-            cfg.default_project = _choose_default_project(cfg)
+            choice = _choose_default_project(cfg)
+            if choice is _BACK:
+                continue
+            cfg.default_project = choice
         elif action == "role":
-            cfg.machine_role = prompts.select(
+            choice = prompts.select(
                 "This machine is:",
                 [
                     Choice("A", "Computer A — internet-connected, exports packages"),
                     Choice("B", "Computer B — air-gapped, imports packages"),
+                    Choice(_BACK, "(back)"),
                 ],
                 default=cfg.machine_role,
             )
+            if choice is _BACK:
+                continue
+            cfg.machine_role = choice
         elif action == "size":
             cfg.max_payload_mb = int(
                 prompts.text(
@@ -532,31 +560,105 @@ def config_cmd() -> None:
                 )
             )
         elif action == "refs":
-            cfg.export_refs = prompts.select(
+            choice = prompts.select(
                 "Which refs should an export include?",
                 [
                     Choice("branch", "Current branch only", "smaller packages"),
                     Choice("all", "All branches and tags", "larger, but complete"),
+                    Choice(_BACK, "(back)"),
                 ],
                 default=cfg.export_refs,
             )
+            if choice is _BACK:
+                continue
+            cfg.export_refs = choice
+        elif action == "exclude":
+            _edit_exclude_patterns(cfg)
         elif action == "hashes":
             _edit_hashes(cfg)
 
         config_mod.save(cfg)
 
 
-def _choose_default_project(cfg: Config) -> str | None:
+def _choose_default_project(cfg: Config) -> object:
+    """Returns the chosen project name, ``None`` for "no default", or ``_BACK``."""
     root = config_mod.resolve_path(cfg.projects_root)
     if root is None or not root.exists():
         raise EnvironmentError_("Set the projects root first.")
     repos = git.discover_repos(root)
     if not repos:
         raise EnvironmentError_(f"No git repositories found under {root}.")
-    choices = [Choice(None, "(no default)")] + [
-        Choice(r.name, r.name, is_default=r.name == cfg.default_project) for r in repos
-    ]
+    choices = (
+        [Choice(None, "(no default)")]
+        + [Choice(r.name, r.name, is_default=r.name == cfg.default_project) for r in repos]
+        + [Choice(_BACK, "(back)")]
+    )
     return prompts.select("Default project", choices, default=cfg.default_project)
+
+
+def _edit_exclude_patterns(cfg: Config) -> None:
+    """Global patterns, plus a per-project addition list — see
+    Config.effective_exclude_patterns for how the two combine."""
+    while True:
+        scope = prompts.select(
+            "Exclude patterns",
+            [
+                Choice("global", "Edit the global list", "applies to every project"),
+                Choice("project", "Edit one project's additions", "on top of the global list"),
+                Choice(_BACK, "(back)"),
+            ],
+        )
+        if scope is _BACK:
+            return
+        if scope == "global":
+            _edit_pattern_list(cfg.exclude_patterns, "global exclude patterns")
+            config_mod.save(cfg)
+        else:
+            if not cfg.projects:
+                displays.note("No projects recorded yet.", Pill.PENDING)
+                continue
+            name = prompts.select(
+                "Which project?",
+                [Choice(n, n) for n in sorted(cfg.projects)] + [Choice(_BACK, "(back)")],
+            )
+            if name is _BACK:
+                continue
+            state = cfg.project(name)
+            _edit_pattern_list(state.exclude_patterns, f"'{name}' additions")
+            config_mod.save(cfg)
+
+
+def _edit_pattern_list(patterns: list[str], label: str) -> None:
+    """Mutates ``patterns`` in place via an add/remove submenu."""
+    while True:
+        displays.panel(
+            f"Exclude patterns ({label})",
+            [f"  - {p}" for p in patterns] or ["  (none)"],
+            Pill.INFO,
+        )
+        action = prompts.select(
+            "Exclude patterns",
+            [
+                Choice("add", "Add a pattern"),
+                Choice("remove", "Remove a pattern"),
+                Choice(_BACK, "(back)"),
+            ],
+        )
+        if action is _BACK:
+            return
+        if action == "add":
+            pattern = prompts.text(
+                "Pattern (gitignore-style, e.g. CLAUDE.md, .claude/**, docs/*.local.md)"
+            ).strip()
+            if pattern and pattern not in patterns:
+                patterns.append(pattern)
+        elif action == "remove":
+            if not patterns:
+                continue
+            choices = [Choice(p, p) for p in patterns] + [Choice(_BACK, "(back)")]
+            selection = prompts.select("Remove which pattern?", choices)
+            if selection is not _BACK:
+                patterns.remove(selection)
 
 
 def _edit_hashes(cfg: Config) -> None:

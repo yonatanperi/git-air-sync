@@ -200,6 +200,105 @@ class PatchSeries(GitOpsBase):
         self.assertFalse(git.working_tree_status(self.repo).dirty)
 
 
+class ExcludePatterns(GitOpsBase):
+    def test_format_patch_drops_a_fully_excluded_commit_and_renumbers(self) -> None:
+        commit(self.repo, "claude", "CLAUDE.md", body="notes\n")
+        commit(self.repo, "three", "three.txt")
+
+        patch = self.root / "excluded.patch"
+        git.format_patch(
+            self.repo, patch, ["--root", "main"], exclude_patterns=["CLAUDE.md"]
+        )
+        text = patch.read_text(encoding="utf-8")
+        subjects = [line for line in text.splitlines() if line.startswith("Subject:")]
+        self.assertEqual(len(subjects), 3)  # "one", "two", "three" — not "claude"
+        self.assertNotIn("claude", text.lower())
+        self.assertIn("[PATCH 3/3]", text)
+
+
+class AutoResolveConflicts(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self.addCleanup(self._tmp.cleanup)
+        self.repo = init_repo(self.root / "repo")
+        commit(self.repo, "base", "CLAUDE.md", body="base\n")
+
+    def _conflict_on(self, filename: str, *, delete_locally: bool = False) -> Path:
+        run(["git", "checkout", "-q", "-b", "side"], self.repo)
+        commit(self.repo, "side change", filename, body="from side\n")
+        patch = self.root / "side.patch"
+        git.format_patch(self.repo, patch, ["main..side"])
+        run(["git", "checkout", "-q", "main"], self.repo)
+        if delete_locally:
+            run(["git", "rm", "-q", filename], self.repo)
+            run(["git", "commit", "-q", "-m", "local delete"], self.repo)
+        else:
+            commit(self.repo, "local change", filename, body="from local\n")
+        result = git.am_apply(self.repo, patch, three_way=True)
+        self.assertFalse(result.ok)
+        self.assertTrue(git.am_in_progress(self.repo))
+        return patch
+
+    def test_keep_ours_restores_the_local_content_on_a_normal_conflict(self) -> None:
+        self._conflict_on("CLAUDE.md")
+        git.resolve_conflict_keep_ours(self.repo, "CLAUDE.md")
+        self.assertEqual((self.repo / "CLAUDE.md").read_text(), "from local\n")
+        self.assertNotIn("CLAUDE.md", git.conflicted_files(self.repo))
+
+    def test_keep_ours_falls_back_to_rm_when_locally_deleted(self) -> None:
+        self._conflict_on("CLAUDE.md", delete_locally=True)
+        git.resolve_conflict_keep_ours(self.repo, "CLAUDE.md")
+        self.assertFalse((self.repo / "CLAUDE.md").exists())
+        self.assertNotIn("CLAUDE.md", git.conflicted_files(self.repo))
+
+    def test_continue_or_skip_picks_skip_when_nothing_is_staged(self) -> None:
+        self._conflict_on("CLAUDE.md")
+        git.resolve_conflict_keep_ours(self.repo, "CLAUDE.md")
+        self.assertFalse(git.has_staged_changes(self.repo))
+        result = git.continue_or_skip_am(self.repo)
+        self.assertTrue(result.ok)
+        self.assertFalse(git.am_in_progress(self.repo))
+        # The auto-resolved commit was skipped, not committed.
+        self.assertNotIn("side change", [c.subject for c in git.list_commits(self.repo, "main")])
+
+    def test_continue_or_skip_picks_continue_when_something_is_staged(self) -> None:
+        self._conflict_on("CLAUDE.md")
+        (self.repo / "CLAUDE.md").write_text("merged by hand\n", encoding="utf-8")
+        run(["git", "add", "CLAUDE.md"], self.repo)
+        self.assertTrue(git.has_staged_changes(self.repo))
+        result = git.continue_or_skip_am(self.repo)
+        self.assertTrue(result.ok)
+        self.assertFalse(git.am_in_progress(self.repo))
+        self.assertIn("side change", [c.subject for c in git.list_commits(self.repo, "main")])
+
+    def test_full_series_with_excluded_commit_followed_by_a_clean_one(self) -> None:
+        """CLAUDE.md conflicts and is auto-resolved (skipped); the next commit,
+        touching an unrelated file, still applies normally right after."""
+        run(["git", "checkout", "-q", "-b", "side"], self.repo)
+        commit(self.repo, "side claude", "CLAUDE.md", body="from side\n")
+        commit(self.repo, "side other", "other.txt", body="from side\n")
+        patch = self.root / "series.patch"
+        git.format_patch(self.repo, patch, ["main..side"])
+        run(["git", "checkout", "-q", "main"], self.repo)
+        commit(self.repo, "local claude", "CLAUDE.md", body="from local\n")
+
+        result = git.am_apply(self.repo, patch, three_way=True)
+        self.assertFalse(result.ok)
+        self.assertIn("CLAUDE.md", git.conflicted_files(self.repo))
+
+        git.resolve_conflict_keep_ours(self.repo, "CLAUDE.md")
+        result = git.continue_or_skip_am(self.repo)
+        self.assertTrue(result.ok)
+        self.assertFalse(git.am_in_progress(self.repo))
+
+        self.assertEqual((self.repo / "CLAUDE.md").read_text(), "from local\n")
+        self.assertEqual((self.repo / "other.txt").read_text(), "from side\n")
+        subjects = [c.subject for c in git.list_commits(self.repo, "main")]
+        self.assertIn("side other", subjects)
+        self.assertNotIn("side claude", subjects)
+
+
 class Runner(unittest.TestCase):
     def test_failure_raises_with_stderr_attached(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

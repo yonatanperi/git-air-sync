@@ -242,10 +242,13 @@ def export_summary(result: Any) -> None:
     from ..core.sync import human_size
 
     base = plan.base[:7] if plan.base else "(full history)"
+    commits_line = f"Commits        {result.commit_count}"
+    if result.commit_count != plan.commit_count:
+        commits_line += f"  ({plan.commit_count - result.commit_count} excluded)"
     lines = [
         f"Project        {result.project}",
         f"Branch         {plan.branch}",
-        f"Commits        {plan.commit_count}",
+        commits_line,
         f"Range          {base} {icon('arrow')} {plan.head[:7]}",
         f"Patch series   {human_size(result.patch_bytes)}",
         f"Document       {human_size(result.docx_bytes)}  ({result.ratio:.2f}x)",
@@ -260,7 +263,9 @@ def export_summary(result: Any) -> None:
     panel("Export complete", lines, Pill.SUCCESS)
 
 
-def conflict_panel(repo: Any, conflicts: Sequence[str], project: str) -> None:
+def conflict_panel(
+    repo: Any, conflicts: Sequence[str], project: str, auto_resolved: Sequence[str] = ()
+) -> None:
     lines = [
         f"Applying the patch series stopped with {len(conflicts)} conflicted file(s):",
         "",
@@ -268,6 +273,15 @@ def conflict_panel(repo: Any, conflicts: Sequence[str], project: str) -> None:
     ]
     if len(conflicts) > 20:
         lines.append(f"  … and {len(conflicts) - 20} more")
+    if auto_resolved:
+        lines += [
+            "",
+            f"{len(auto_resolved)} other file(s) matched an exclude pattern and were",
+            "auto-resolved by keeping your local version — they are NOT part of the",
+            "conflict below and need no action:",
+            "",
+            *(f"  {icon('bullet')} {path}" for path in auto_resolved[:20]),
+        ]
     lines += [
         "",
         "Resolve them the normal way:",

@@ -9,12 +9,13 @@ from __future__ import annotations
 
 import atexit
 import hashlib
+import re
 import shutil
 import socket
 import tempfile
 import time
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator, Protocol
@@ -27,7 +28,7 @@ from ..errors import (
     NothingToDo,
     UserAbort,
 )
-from . import codec, envelope as env, git_ops as git
+from . import codec, envelope as env, git_ops as git, patterns as pat
 
 SCRATCH_PREFIX = "git-air-sync-"
 STALE_AFTER_SECONDS = 24 * 60 * 60
@@ -124,6 +125,9 @@ class ExportResult:
     patch_bytes: int
     docx_bytes: int
     payload_sha256: str
+    # Commits actually present in the transmitted patch series — can be lower
+    # than plan.commit_count when exclude patterns dropped whole commits.
+    commit_count: int = 0
 
     @property
     def ratio(self) -> float:
@@ -263,6 +267,7 @@ def export_project(
     assume_yes: bool = False,
     max_payload_mb: int = 25,
     export_refs: str = "branch",
+    exclude_patterns: list[str] | None = None,
 ) -> ExportResult:
     with reporter.step(1, 4, "Scanning repository"):
         plan = resolve_export_plan(
@@ -305,11 +310,17 @@ def export_project(
         patch_path = scratch / f"{project}.patch"
 
         with reporter.step(2, 4, "Creating patch series"):
-            git.format_patch(repo, patch_path, plan.revs)
+            git.format_patch(repo, patch_path, plan.revs, exclude_patterns=exclude_patterns)
             patch_bytes = patch_path.read_bytes()
 
         if not patch_bytes:
             raise EnvironmentError_("git produced an empty patch series.")
+
+        # Excluding files can drop whole commits from the series (a commit whose
+        # entire diff falls under an excluded pattern is left out entirely), so
+        # the transmitted count can be lower than `plan.commit_count`, which was
+        # computed before any exclusion was applied.
+        actual_commit_count = len(re.findall(rb"(?m)^From [0-9a-fA-F]{40,64} ", patch_bytes))
 
         estimated = codec.estimate_docx_size(len(patch_bytes))
         _check_disk_space(out_dir, estimated)
@@ -336,7 +347,7 @@ def export_project(
                 package_mode=plan.mode,
                 base_sha=plan.base,
                 head_sha=plan.head,
-                commit_count=plan.commit_count,
+                commit_count=actual_commit_count,
                 hash_algo=git.object_format(repo),
                 created_at=_utc_now(),
                 created_by=f"{socket.gethostname()}",
@@ -357,6 +368,7 @@ def export_project(
         patch_bytes=len(patch_bytes),
         docx_bytes=docx_bytes,
         payload_sha256=hashlib.sha256(patch_bytes).hexdigest(),
+        commit_count=actual_commit_count,
     )
 
 
@@ -378,6 +390,53 @@ class ImportResult:
     # (Computer A's hash), which `git am` never reproduces. None when nothing was
     # actually applied to the real repo (the --no-merge / do_merge=False path).
     local_head: str | None = None
+    auto_resolved: list[str] = field(default_factory=list)
+
+
+@dataclass
+class AmOutcome:
+    ok: bool  # applied clean, or every conflict was auto-resolved
+    conflicts: list[str]  # genuinely unresolved conflicts (empty when ok)
+    auto_resolved: list[str]  # paths kept-local because they matched an exclude pattern
+
+
+def _apply_with_auto_resolve(
+    repo: Path, patch_path: Path, exclude_patterns: list[str]
+) -> AmOutcome:
+    """Runs ``git am --3way``, then hands off to :func:`_drain_conflicts`."""
+    result = git.am_apply(repo, patch_path, three_way=True)
+    return _drain_conflicts(repo, exclude_patterns, result)
+
+
+def _drain_conflicts(repo: Path, exclude_patterns: list[str], result: git.GitResult) -> AmOutcome:
+    """While ``am`` is stopped on conflicts, auto-resolve any conflicted path
+    that matches ``exclude_patterns`` by keeping the local copy, and continue —
+    looping, since a patch series has multiple commits and resolving one can
+    reveal a conflict in the next. Stops the instant a genuine (non-excluded)
+    conflict shows up, leaving ``am`` mid-conflict exactly as before this
+    feature existed, so the normal abort/resolve flow is untouched for real
+    conflicts. ``result`` is the outcome of whatever just ran (``am``,
+    ``am --continue``, or ``am --skip``) immediately before this call.
+    """
+    auto_resolved: list[str] = []
+    while not result.ok and git.am_in_progress(repo):
+        conflicts = git.conflicted_files(repo)
+        excluded = [p for p in conflicts if pat.matches_any(p, exclude_patterns)]
+        genuine = [p for p in conflicts if p not in excluded]
+        if genuine:
+            return AmOutcome(ok=False, conflicts=genuine, auto_resolved=auto_resolved)
+        for path in excluded:
+            git.resolve_conflict_keep_ours(repo, path)
+        auto_resolved.extend(excluded)
+        result = git.continue_or_skip_am(repo)
+
+    if not result.ok and not git.am_in_progress(repo):
+        # A hard failure unrelated to conflicts (corrupt patch, hook failure, …) —
+        # surface it exactly like before, don't swallow it as "conflicts".
+        detail = (result.stderr or result.stdout).strip()
+        raise EnvironmentError_(f"Applying the patch series failed:\n{detail}")
+
+    return AmOutcome(ok=True, conflicts=[], auto_resolved=auto_resolved)
 
 
 def import_document(
@@ -401,6 +460,8 @@ def import_document(
     state = cfg.project(meta.project)
     if state.last_payload_sha256 and meta.payload_sha256 == state.last_payload_sha256:
         raise NothingToDo(f"'{meta.project}' has already imported this exact package.")
+
+    effective_excludes = cfg.effective_exclude_patterns(meta.project)
 
     with scratch_dir() as scratch:
         patch_path = scratch / f"{meta.project}.patch"
@@ -459,9 +520,10 @@ def import_document(
                 worktree = preview_scratch / "wt"
                 git.add_worktree(repo, worktree, ours)
                 try:
-                    dry_run = git.am_apply(worktree, patch_path, three_way=True)
+                    dry_run = _apply_with_auto_resolve(worktree, patch_path, effective_excludes)
                     clean = dry_run.ok
-                    conflicts = [] if clean else git.conflicted_files(worktree)
+                    conflicts = dry_run.conflicts
+                    dry_auto_resolved = dry_run.auto_resolved
                     commits = git.list_commits(worktree, f"{original_tip}..HEAD")
                     files = git.changed_files(worktree, original_tip, "HEAD")
                     if not clean and git.am_in_progress(worktree):
@@ -480,14 +542,20 @@ def import_document(
             return ImportResult(
                 meta.project, repo, meta,
                 git.ApplyOutcome.APPLIED if clean else git.ApplyOutcome.CONFLICT,
-                commits, files, conflicts, applied=False,
+                commits, files, conflicts, applied=False, auto_resolved=dry_auto_resolved,
             )
 
         if not assume_yes:
             reporter.show_commits(commits, f"{len(commits)} incoming commit(s)")
             reporter.show_files(files, "Files affected")
             if clean:
-                reporter.info("This will apply cleanly.")
+                note = "This will apply cleanly."
+                if dry_auto_resolved:
+                    note += (
+                        f" ({len(dry_auto_resolved)} excluded file(s) will be "
+                        "auto-resolved by keeping your local version.)"
+                    )
+                reporter.info(note)
             else:
                 reporter.warn(
                     "Conflicts predicted",
@@ -516,23 +584,21 @@ def import_document(
                 raise UserAbort("Aborted because of uncommitted changes.")
 
         with reporter.step(4, 4, "Applying patches"):
-            result = git.am_apply(repo, patch_path, three_way=True)
             # Raised inside the step so it reports failure rather than printing
             # "done" and then contradicting itself with a conflict panel.
-            if not result.ok:
-                if git.am_in_progress(repo):
-                    real_conflicts = git.conflicted_files(repo)
-                    _record_conflict(cfg, meta, repo, real_conflicts)
-                    raise MergeConflictDetail(meta, repo, real_conflicts, commits, files)
-                detail = (result.stderr or result.stdout).strip()
-                raise EnvironmentError_(f"Applying the patch series failed:\n{detail}")
+            outcome = _apply_with_auto_resolve(repo, patch_path, effective_excludes)
+            if not outcome.ok:
+                _record_conflict(cfg, meta, repo, outcome.conflicts, outcome.auto_resolved)
+                raise MergeConflictDetail(
+                    meta, repo, outcome.conflicts, commits, files, outcome.auto_resolved
+                )
 
     import_head = git.resolve_sha(repo, ours)
     _record_import(cfg, meta, repo, import_head)
 
     return ImportResult(
         meta.project, repo, meta, git.ApplyOutcome.APPLIED, commits, files, [],
-        applied=True, local_head=import_head,
+        applied=True, local_head=import_head, auto_resolved=outcome.auto_resolved,
     )
 
 
@@ -546,6 +612,7 @@ class MergeConflictDetail(MergeConflict):
         conflicts: list[str],
         commits: list[git.CommitInfo],
         files: list[git.FileChange],
+        auto_resolved: list[str] | None = None,
     ) -> None:
         super().__init__(f"{len(conflicts)} conflicted file(s) in {repo}")
         self.envelope = meta
@@ -553,6 +620,7 @@ class MergeConflictDetail(MergeConflict):
         self.conflicts = conflicts
         self.commits = commits
         self.files = files
+        self.auto_resolved = auto_resolved or []
 
 
 # ------------------------------------------------------------------------- resolve
@@ -569,15 +637,18 @@ def finalize_resolution(repo: Path, project: str, cfg: Config) -> bool:
         )
 
     if git.am_in_progress(repo):
-        result = git.continue_am(repo)
-        if not result.ok:
-            detail = (result.stderr or result.stdout).strip()
-            raise MergeConflict(f"'git am --continue' did not finish cleanly:\n{detail}")
-        if git.am_in_progress(repo) or git.conflicted_files(repo):
+        result = git.continue_or_skip_am(repo)
+        # Resolving that commit can uncover a conflict further along the patch
+        # series — auto-resolve it too if it's on an excluded path, exactly like
+        # the initial apply, so an irrelevant file never needs a second manual
+        # round-trip through 'resolve'.
+        outcome = _drain_conflicts(repo, cfg.effective_exclude_patterns(project), result)
+        if not outcome.ok:
             raise MergeConflict(
-                "Resolving that file uncovered another conflict further along the "
-                "patch series. Run 'git status', resolve it the same way, then "
-                "'git-air-sync resolve' again."
+                f"Resolving that file uncovered {len(outcome.conflicts)} more "
+                "conflicted file(s) further along the patch series:\n"
+                + "\n".join(f"  {p}" for p in outcome.conflicts)
+                + "\n\nResolve them, 'git add' each one, then run 'git-air-sync resolve' again."
             )
 
     branch = git.current_branch(repo) or "HEAD"
@@ -625,7 +696,11 @@ def _record_import(cfg: Config, meta: env.Envelope, repo: Path, import_head: str
 
 
 def _record_conflict(
-    cfg: Config, meta: env.Envelope, repo: Path, conflicts: list[str]
+    cfg: Config,
+    meta: env.Envelope,
+    repo: Path,
+    conflicts: list[str],
+    auto_resolved: list[str] | None = None,
 ) -> None:
     state = cfg.project(meta.project)
     state.path = str(repo)
@@ -635,6 +710,7 @@ def _record_conflict(
         "source_branch": meta.source_branch,
         "payload_sha256": meta.payload_sha256,
         "files": conflicts,
+        "auto_resolved": auto_resolved or [],
         "detected_at": _utc_now(),
     }
     save(cfg)

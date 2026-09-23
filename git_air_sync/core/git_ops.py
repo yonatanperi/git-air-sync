@@ -18,6 +18,7 @@ from enum import Enum
 from pathlib import Path
 
 from ..errors import EnvironmentError_
+from . import patterns as pat
 
 # Record/unit separators — cannot occur in a commit subject.
 _RS = "\x1e"
@@ -335,14 +336,25 @@ def working_tree_status(repo: Path) -> WorkingTree:
 # ---------------------------------------------------------------------- patch series
 
 
-def format_patch(repo: Path, out_path: Path, revs: list[str]) -> None:
+def format_patch(
+    repo: Path, out_path: Path, revs: list[str], *, exclude_patterns: list[str] | None = None
+) -> None:
     """``git format-patch --stdout <revs>``, written to ``out_path`` as a single
     concatenated mailbox file that ``git am`` can consume directly.
+
+    ``exclude_patterns`` (gitignore-style, see :mod:`patterns`) restricts the diff
+    with a pathspec, so a commit whose entire diff falls under an excluded pattern
+    is dropped from the series outright (verified: no empty-diff patch is emitted,
+    the surviving series is renumbered) rather than transmitted and later fought
+    over on the receiving end.
 
     Callers must ensure the range is non-empty — an empty range produces an empty
     file rather than an error, so the caller checks the resulting file size instead.
     """
-    result = run_git(_repo(repo, ["format-patch", "--stdout", "--no-color", *revs]))
+    args = ["format-patch", "--stdout", "--no-color", *revs]
+    if exclude_patterns:
+        args += ["--", ".", *(pat.to_pathspec(p) for p in exclude_patterns)]
+    result = run_git(_repo(repo, args))
     out_path.write_text(result.stdout, encoding="utf-8")
 
 
@@ -415,6 +427,41 @@ def conflicted_files(repo: Path) -> list[str]:
     if not result.ok:
         return []
     return [p for p in result.stdout.split("\0") if p]
+
+
+def resolve_conflict_keep_ours(repo: Path, path: str) -> None:
+    """During an ``am --3way`` conflict, keep the local (HEAD) side of ``path``
+    and stage it. ``--ours`` in an ``am`` conflict is unambiguously the local
+    side (unlike a rebase, where the meaning flips) since ``am`` always merges
+    the incoming patch onto the current HEAD.
+
+    Falls back to ``git rm`` when HEAD deleted the file (a DU conflict) — there
+    is no "ours" blob for ``checkout --ours`` to restore, and "keep local"
+    there means "stay deleted".
+    """
+    ours = run_git(_repo(repo, ["checkout", "--ours", "--", path]), check=False)
+    if ours.ok:
+        run_git(_repo(repo, ["add", "--", path]))
+    else:
+        run_git(_repo(repo, ["rm", "-f", "--", path]), check=False)
+
+
+def has_staged_changes(repo: Path) -> bool:
+    """Whether the index differs from HEAD, i.e. ``am --continue`` has
+    something to commit."""
+    return not run_git(_repo(repo, ["diff", "--cached", "--quiet", "HEAD"]), check=False).ok
+
+
+def continue_or_skip_am(repo: Path) -> GitResult:
+    """``git am --continue``, or ``git am --skip`` when a resolution left the
+    index identical to HEAD — ``--continue`` refuses that with "No changes -
+    did you forget to use 'git add'?", which happens whenever every file in a
+    conflicted commit was auto-resolved by keeping the local (already-HEAD)
+    content.
+    """
+    if has_staged_changes(repo):
+        return continue_am(repo)
+    return run_git(_repo(repo, ["am", "--skip"]), check=False)
 
 
 def delete_ref(repo: Path, ref: str) -> None:

@@ -20,6 +20,10 @@ from typing import Any
 
 CONFIG_VERSION = 1
 DEFAULT_MAX_PAYLOAD_MB = 25
+# Files that are never part of the sync contract: stripped from the patch series
+# at export time, and kept-local if one still shows up conflicted at import time
+# (see core/patterns.py and core/sync.py's _apply_with_auto_resolve).
+DEFAULT_EXCLUDE_PATTERNS = ["CLAUDE.md", ".claude/**"]
 
 
 def config_path() -> Path:
@@ -48,6 +52,8 @@ class ProjectState:
     # see `status` in main.py.
     last_import_head: str | None = None
     pending_conflict: dict[str, Any] | None = None
+    # Additions on top of Config.exclude_patterns, for this project only.
+    exclude_patterns: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -60,10 +66,21 @@ class Config:
     export_output_dir: str | None = None
     max_payload_mb: int = DEFAULT_MAX_PAYLOAD_MB
     export_refs: str = "branch"  # "branch" | "all"
+    exclude_patterns: list[str] = field(default_factory=lambda: list(DEFAULT_EXCLUDE_PATTERNS))
     projects: dict[str, ProjectState] = field(default_factory=dict)
     _unknown: dict[str, Any] = field(default_factory=dict, repr=False)
 
     # ------------------------------------------------------------------ accessors
+
+    def effective_exclude_patterns(self, project_name: str) -> list[str]:
+        """This project's exclude patterns: the global list plus its own
+        additions, deduped. Never overrides — a project can only add patterns,
+        not un-exclude a globally excluded one."""
+        from .core import patterns
+
+        state = self.projects.get(project_name)
+        extra = state.exclude_patterns if state else []
+        return patterns.dedupe([*self.exclude_patterns, *extra])
 
     @property
     def role_label(self) -> str:

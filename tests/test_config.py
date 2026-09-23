@@ -101,6 +101,45 @@ class LoadSave(ConfigBase):
         self.assertIn("full resync", str(caught.exception))
 
 
+class ExcludePatterns(ConfigBase):
+    def test_a_fresh_config_seeds_the_default_patterns(self) -> None:
+        cfg = config_mod.load()
+        self.assertEqual(cfg.exclude_patterns, config_mod.DEFAULT_EXCLUDE_PATTERNS)
+
+    def test_an_existing_config_without_the_key_also_gets_the_default(self) -> None:
+        # Simulates a config saved by a version of git-air-sync before this
+        # feature existed — no migration code should be needed for this.
+        self.path.write_text(json.dumps({"version": 1, "machine_role": "A"}), encoding="utf-8")
+        cfg = config_mod.load()
+        self.assertEqual(cfg.exclude_patterns, config_mod.DEFAULT_EXCLUDE_PATTERNS)
+
+    def test_effective_patterns_are_the_union_of_global_and_project(self) -> None:
+        cfg = config_mod.load()
+        cfg.exclude_patterns = ["CLAUDE.md"]
+        cfg.project("alpha").exclude_patterns = ["secrets.local.json"]
+
+        effective = cfg.effective_exclude_patterns("alpha")
+        self.assertEqual(effective, ["CLAUDE.md", "secrets.local.json"])
+        # A project with no additions just gets the global list.
+        self.assertEqual(cfg.effective_exclude_patterns("beta"), ["CLAUDE.md"])
+
+    def test_effective_patterns_are_deduped(self) -> None:
+        cfg = config_mod.load()
+        cfg.exclude_patterns = ["CLAUDE.md"]
+        cfg.project("alpha").exclude_patterns = ["CLAUDE.md", "extra.txt"]
+        self.assertEqual(cfg.effective_exclude_patterns("alpha"), ["CLAUDE.md", "extra.txt"])
+
+    def test_exclude_patterns_round_trip(self) -> None:
+        cfg = config_mod.load()
+        cfg.exclude_patterns = ["CLAUDE.md", ".claude/**"]
+        cfg.project("alpha").exclude_patterns = ["extra.txt"]
+        config_mod.save(cfg)
+
+        again = config_mod.load()
+        self.assertEqual(again.exclude_patterns, ["CLAUDE.md", ".claude/**"])
+        self.assertEqual(again.project("alpha").exclude_patterns, ["extra.txt"])
+
+
 class Validation(ConfigBase):
     def test_projects_root_must_exist(self) -> None:
         ok, reason = config_mod.validate_projects_root(str(self.root / "nope"))
